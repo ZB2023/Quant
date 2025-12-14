@@ -222,16 +222,39 @@ class BotDownloadModel(BaseModel):
 def reg(d: AuthModel):
     try:
         with get_cursor() as cur:
+            # Проверка: занят ли логин
             cur.execute("SELECT 1 FROM users WHERE username = %s", (d.login,))
             if cur.fetchone():
-                raise HTTPException(400, "User exists")
-            cur.execute("INSERT INTO users (username, email, password_hash, created_at) VALUES (%s, %s, %s, NOW()) RETURNING id", (d.login, d.email, hash_pw(d.pw)))
-            uid = cur.fetchone()['id']
+                # Это НЕ ошибка сервера, это логическая ошибка клиента (400)
+                raise HTTPException(status_code=400, detail="User exists")
+
+            # Вставка данных (обрабатываем email если он пуст)
+            email_val = d.email if d.email else ""
+            
+            cur.execute(
+                "INSERT INTO users (username, email, password_hash, created_at) VALUES (%s, %s, %s, NOW()) RETURNING id", 
+                (d.login, email_val, hash_pw(d.pw))
+            )
+            
+            # Получаем ID (поддержка разных типов курсора)
+            row = cur.fetchone()
+            uid = row['id'] if isinstance(row, dict) else row[0]
+            
+            # Создаем профиль
             cur.execute("INSERT INTO user_profiles (user_id) VALUES (%s)", (uid,))
             return {"status": "ok", "uid": uid}
+
+    # ВАЖНО: Сначала ловим HTTPException и просто "пробрасываем" его дальше
+    except HTTPException:
+        raise 
+
+    # Ловим всё остальное (настоящие поломки)
     except Exception as e:
+        import traceback
+        print("!!! REAL ERROR !!!")
+        print(traceback.format_exc())
         logger.error(f"Register error: {e}")
-        raise HTTPException(500, "Internal server error")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/login")
 def login(d: AuthModel):

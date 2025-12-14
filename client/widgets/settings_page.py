@@ -594,11 +594,11 @@ class SwDialog(BDialog):
             self.w = None # Сброс ссылки
 
     def closeEvent(self, e):
-        # Если закрыли окно крестиком во время загрузки
+        # Гарантированная остановка потока
         if self.w and self.w.isRunning():
-            self.w.res.disconnect() # Отцепляем сигнал, чтобы не крашнуло
+            self.w.res.disconnect() # Отцепляем сигнал, чтобы не крашнуло при ответе в мертвый диалог
             self.w.quit()
-            self.w.wait()
+            self.w.wait() # Ждем завершения
         super().closeEvent(e)
 
 class DelDialog(BDialog):

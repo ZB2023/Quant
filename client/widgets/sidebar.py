@@ -15,16 +15,18 @@ class Fetcher(QRunnable):
         self.api = api
         self.u = u
         self.signals = FetcherSignals()
+        self.setAutoDelete(True) # Важно: автоудаление
         
     def run(self):
         try:
-            r = requests.get(f"{self.api}/user/profile_info", params={"username": self.u}, verify=False, timeout=5)
+            # Делаем короткий таймаут
+            r = requests.get(f"{self.api}/user/profile_info", params={"username": self.u}, verify=False, timeout=3)
             if r.status_code == 200:
                 u = r.json().get('avatar_url')
                 if u:
                     if u.startswith("/"):
                         u = f"{self.api}{u}"
-                    res = requests.get(u, verify=False, timeout=5)
+                    res = requests.get(u, verify=False, timeout=3)
                     self.signals.done.emit(res.content)
         except:
             pass
@@ -35,6 +37,8 @@ class Sidebar(QWidget):
         self.setFixedWidth(260)
         self.setObjectName("Sidebar")
         self.u_name = "Guest"
+        self._is_alive = True  # Флаг жизни виджета
+
         l = QVBoxLayout(self)
         l.setContentsMargins(20, 40, 20, 20)
         l.setSpacing(10)
@@ -80,5 +84,18 @@ class Sidebar(QWidget):
     def reload_avatar(self):
         self.av.set_letter(self.u_name)
         f = Fetcher(API_URL, self.u_name)
-        f.signals.done.connect(self.av.set_data)
+        f.signals.done.connect(self.on_avatar_loaded) # Подключаем не напрямую
         QThreadPool.globalInstance().start(f)
+
+    def on_avatar_loaded(self, data):
+        # ЗАЩИТА: Если виджет уже удален или помечен как мертвый, не трогаем UI
+        if not self._is_alive: 
+            return
+        try:
+            self.av.set_data(data)
+        except RuntimeError:
+            pass # Если вдруг C++ объект удален
+
+    def closeEvent(self, event):
+        self._is_alive = False
+        super().closeEvent(event)

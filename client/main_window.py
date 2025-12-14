@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QStackedWidget
-from PySide6.QtCore import QTimer, QCoreApplication
+from PySide6.QtCore import QTimer, QCoreApplication, QThreadPool
 from client.widgets.auth_forms import AuthPage
 from client.widgets.lanchat_page import LanChatWidget, LanSetupWidget, LanWorker
 from client.widgets.messages_page.network import ThreadPoolManager
@@ -21,14 +21,14 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
         
-        # Страница авторизации (она постоянна, её не пересоздаем)
+        # Страница авторизации (постоянная)
         self.auth_page = AuthPage()
-        self.auth_page.login_success.connect(self.on_login_start) # Изменили слот
+        # ВАЖНО: При смене юзера используем отложенный переход, чтобы разорвать стек вызовов
+        self.auth_page.login_success.connect(lambda u: QTimer.singleShot(50, lambda: self.on_login_start(u)))
         self.auth_page.go_to_lan_requested.connect(self.start_lan_mode)
         self.stack.addWidget(self.auth_page)
 
         # Контейнер для основного интерфейса
-        # Мы будем очищать его и наполнять заново при входе
         self.main_container = QWidget()
         self.main_layout = QHBoxLayout(self.main_container)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
         
         self.stack.addWidget(self.main_container)
 
-        # LAN компоненты (не меняем)
+        # LAN компоненты
         self.lan_worker = LanWorker()
         self.lan_setup = LanSetupWidget(self.lan_worker)
         self.lan_setup.back_signal.connect(self.exit_lan_mode)
@@ -51,113 +51,98 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.lan_chat)
 
     def on_login_start(self, username):
-        # Делаем паузу перед уничтожением мира
-        QTimer.singleShot(10, lambda: self._perform_switch(username))
+        """Слот, принимающий сигнал о входе."""
+        # Блокируем интерфейс, пока идет перестроение, чтобы юзер не нажал лишнего
+        if self.auth_page:
+            self.auth_page.setEnabled(False)
+            
+        # Даем текущим событиям завершиться, затем переключаем
+        QTimer.singleShot(50, lambda: self._perform_switch(username))
         
     def _perform_switch(self, username):
-        # 1. СБРОС СЕТЕВОГО СЛОЯ
-        # Это инвалидирует все летящие ответы от сервера. 
-        # Даже если ответ придет, он будет проигнорирован и не полезет в удаленный виджет.
-        ThreadPoolManager().clear_all_tasks()
+        """Безопасное переключение контекста."""
         
-        # 2. Остановка LAN
+        # 1. Останавливаем старый LAN Worker
         if hasattr(self, 'lan_worker'):
             self.lan_worker.close()
 
-        # 3. МЯГКОЕ УДАЛЕНИЕ UI
+        # 2. Остановка менеджера задач чатов
+        ThreadPoolManager().clear_all_tasks()
+        
+        # 3. Убиваем ContentArea
         if self.content:
-            # Скрываем, чтобы пользователь не видел процесс умирания
-            self.content.hide() 
+            self.content.hide()
             
-            # Останавливаем таймеры, если есть
-            if hasattr(self.content, 'msg'): self.content.msg.stop_all_workers()
-            if hasattr(self.content, 'fr'): self.content.fr.stop_all_workers()
-            
-            # Отвязываем от лейаута
+            # (A) Отключаем верхнеуровневые сигналы
+            try:
+                self.content.disconnect()
+            except:
+                pass
+
+            # (B) Пытаемся остановить внутренних воркеров
+            # Обратите внимание: добавляем _is_alive=False принудительно, если есть атрибут
+            if hasattr(self.content.pp, 'prof'):
+                 self.content.pp.prof._is_alive = False
+
+            if hasattr(self.content, 'msg'): 
+                self.content.msg.stop_all_workers()
+                
+            if hasattr(self.content, 'fr'): 
+                self.content.fr.stop_all_workers()
+
+            if hasattr(self.content, 'mp'):
+                self.content.mp.stop_all_workers() # Добавленный метод
+
+            # (C) Удаление
             self.main_layout.removeWidget(self.content)
-            self.content.setParent(None) # Важный шаг для разрыва связей C++
-            self.content.deleteLater()   # Планируем удаление
+            self.content.setParent(None)
+            self.content.deleteLater()
             self.content = None
         
+        # 4. Убиваем Sidebar
         if self.sidebar:
+            self.sidebar._is_alive = False # Флаг защиты для сайдбара
+            try: self.sidebar.disconnect() 
+            except: pass
+            
             self.sidebar.hide()
             self.main_layout.removeWidget(self.sidebar)
             self.sidebar.setParent(None)
             self.sidebar.deleteLater()
             self.sidebar = None
 
-        # 4. ОЧИСТКА Qt THREAD POOL
+        # 5. Чистка пула потоков
         from PySide6.QtCore import QThreadPool
         QThreadPool.globalInstance().clear()
         
-        # 5. ДАЕМ Qt ВРЕМЯ НА УБОРКУ
+        # 6. Даем время на сборку мусора Qt
         QCoreApplication.processEvents()
 
-        # 6. СОЗДАЕМ НОВЫЙ ИНТЕРФЕЙС
+        # 7. Строим новый мир
         self.rebuild_main_ui(username)
         self.stack.setCurrentIndex(1)
-
-    def _perform_login(self, username):
-        """Жесткая пересборка интерфейса для нового пользователя."""
         
-        # 1. Если был старый интерфейс — уничтожаем его
-        if self.content:
-            try:
-                # Пытаемся остановить таймеры внутри (если метод реализован)
-                if hasattr(self.content, 'msg') and hasattr(self.content.msg, 'stop_all_workers'):
-                    self.content.msg.stop_all_workers()
-                if hasattr(self.content, 'fr') and hasattr(self.content.fr, 'stop_all_workers'):
-                    self.content.fr.stop_all_workers()
-            except:
-                pass
-            
-            # Отвязываем сигналы, чтобы не крашнуло при deleteLater
-            try:
-                self.content.logout_requested.disconnect()
-                self.content.switch_user_requested.disconnect()
-            except: 
-                pass
-            
-            self.content.deleteLater()
-            self.content = None
-        
-        if self.sidebar:
-            self.sidebar.deleteLater()
-            self.sidebar = None
-            
-        # 2. Очищаем пул потоков (задачи, стоящие в очереди на выполнение)
-        from PySide6.QtCore import QThreadPool
-        QThreadPool.globalInstance().clear()
-        
-        # Даем время Qt обработать удаление объектов
-        QCoreApplication.processEvents()
-
-        # 3. Создаем "чистый" интерфейс с нуля
-        self.rebuild_main_ui(username)
-
-        # 4. Переключаем экран
-        self.stack.setCurrentIndex(1)
-        # Можно сбросить фокус с полей ввода авторизации
         if hasattr(self.auth_page, 'lv'):
             self.auth_page.lv.inp_pass.clear()
+        self.auth_page.setEnabled(True)
 
     def rebuild_main_ui(self, username):
-        """Создает компоненты заново"""
+        """Создает компоненты с нуля."""
         self.sidebar = Sidebar()
         self.sidebar.set_username(username)
-        self.sidebar.setObjectName("Sidebar")
         
         self.content = ContentArea(self.theme_manager)
         
-        # Подключаем сигналы
+        # Подключаем сигналы выхода/смены пользователя
         self.content.logout_requested.connect(self.handle_logout)
-        # Здесь мы снова вызываем on_login_start при смене юзера через настройки
+        
+        # Смена пользователя: ВАЖНО использовать отложенный вызов,
+        # чтобы старый диалог успел закрыться до того, как мы уничтожим ContentArea
         self.content.switch_user_requested.connect(self.on_login_start)
         
-        # Обновление аватара в сайдбаре
+        # Связываем Сайдбар и Контент
         self.content.user_data_changed.connect(lambda: self.sidebar.reload_avatar())
         
-        # Навигация
         self.sidebar.btn_profile.clicked.connect(self.content.show_profile)
         self.sidebar.btn_feed.clicked.connect(self.content.show_feed)
         self.sidebar.btn_media.clicked.connect(self.content.show_media)
@@ -165,22 +150,37 @@ class MainWindow(QMainWindow):
         self.sidebar.btn_msg.clicked.connect(self.content.show_messages)
         self.sidebar.btn_settings.clicked.connect(self.content.show_settings)
         
-        # Добавляем в layout
         self.main_layout.addWidget(self.sidebar)
         self.main_layout.addWidget(self.content)
         
-        # Инициализируем пользователя в контенте
+        # Загружаем данные пользователя
         self.content.set_user(username)
-        # Сразу применяем тему, чтобы новые виджеты окрасились
+        
+        # Применяем тему
         if self.theme_manager:
             self.theme_manager.apply_theme()
             
     def handle_logout(self):
-        # При выходе просто показываем экран логина. 
-        # Старые виджеты уничтожим при следующем входе.
-        self.stack.setCurrentIndex(0) 
+        """
+        При выходе из аккаунта (Log out) - не уничтожаем мир сразу.
+        Просто переключаем экран. Уничтожение старого произойдет 
+        в момент Входа следующего пользователя.
+        """
+        # Сброс пароля в GUI, если он там остался
+        if hasattr(self.auth_page, 'lv'):
+            self.auth_page.lv.inp_pass.clear()
+            self.auth_page.lv.chk_remember.setChecked(False)
+            
+        # Очистка настроек авторизации (чтобы автологин не сработал снова)
+        from PySide6.QtCore import QSettings
+        s = QSettings("QuantProject", "QuantDesktop")
+        s.setValue("remember", "false")
+        s.remove("login")
+        s.remove("password")
+            
+        self.stack.setCurrentIndex(0)
 
-    # --- LAN методы без изменений ---
+    # --- LAN методы ---
     def start_lan_mode(self):
         self.lan_worker.close() 
         self.stack.setCurrentIndex(2)
@@ -198,10 +198,15 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(2)
         
     def closeEvent(self, event):
-        # Глобальная очистка при закрытии приложения
-        from PySide6.QtCore import QThreadPool
+        """Глобальная очистка при закрытии окна."""
         QThreadPool.globalInstance().clear()
         
+        if self.content:
+            try:
+                self.content.msg.stop_all_workers()
+                self.content.fr.stop_all_workers()
+            except: pass
+            
         if hasattr(self, 'lan_worker'):
             self.lan_worker.close()
             

@@ -46,6 +46,8 @@ class PLoader(QRunnable):
 class BaseProfileView(QWidget):
     def __init__(self, username=None, parent=None):
         super().__init__(parent)
+        self._is_alive = True
+        
         self.layout_main = QVBoxLayout(self)
         self.layout_main.setAlignment(Qt.AlignCenter)
         self.layout_main.setContentsMargins(0, 0, 0, 0)
@@ -142,8 +144,7 @@ class BaseProfileView(QWidget):
                 w.setText(str(v))
 
     def set_user(self, u):
-        if not u:
-            return
+        if not u: return
         self.usr = u
         self.n.setText(u)
         self.h.setText(f"@{u.lower()}")
@@ -153,17 +154,28 @@ class BaseProfileView(QWidget):
         self.refresh()
 
     def refresh(self):
-        if hasattr(self, 'usr'):
+        if hasattr(self, 'usr') and self._is_alive:
             l = PLoader(self.usr)
             l.signals.res.connect(self.done)
             QThreadPool.globalInstance().start(l)
 
     def done(self, d, b):
-        self.b.setText(d['bio'] or "No bio.")
-        self.s.setText(d['status'] or "")
-        self.sv(self.l_fr, d['friends'])
-        if b:
-            self.av.set_data(b)
+        # ЗАЩИТА
+        if not self._is_alive: 
+            return
+        try:
+            self.b.setText(d['bio'] or "No bio.")
+            self.s.setText(d['status'] or "")
+            self.sv(self.l_fr, d['friends'])
+            if b:
+                self.av.set_data(b)
+        except RuntimeError:
+            pass
+        
+    # ВАЖНО: Добавьте этот метод
+    def closeEvent(self, event):
+        self._is_alive = False # Ставим флаг, что мы умираем
+        super().closeEvent(event)
 
 class ProfilePage(BaseProfileView):
     pass
