@@ -2,7 +2,6 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Response
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from contextlib import contextmanager
 from app.core.config import Cfg
@@ -12,11 +11,10 @@ import logging
 from typing import List, Optional, Dict, Tuple
 import os
 import uuid
-import yt_dlp
-import shutil
 import time
 import sys
 import traceback
+import yt_dlp  # Убедитесь, что библиотека установлена
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,9 +24,7 @@ logger = logging.getLogger("QuantServer")
 
 app = FastAPI()
 
-# Монтируем статическую папку для аватарок
-os.makedirs("static/avatars", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Папка static больше не используется, файлы хранятся в БД.
 
 typing_status: Dict[str, Tuple[str, float]] = {}
 
@@ -97,11 +93,29 @@ def check_db_schema():
             cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='user_profiles' AND column_name='avatar_url';")
             if not cur.fetchone():
                 cur.execute("ALTER TABLE user_profiles ADD COLUMN avatar_url TEXT")
+
+            # Проверка столбца для хранения байтов аватара
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='user_profiles' AND column_name='avatar_data';")
+            if not cur.fetchone():
+                logger.info("Adding avatar_data column (BYTEA) to user_profiles...")
+                cur.execute("ALTER TABLE user_profiles ADD COLUMN avatar_data BYTEA")
+
     except Exception as e:
         logger.warning(f"Schema check failed: {e}")
 
 check_db_schema()
 
+# --- ФУНКЦИЯ ДЛЯ YOUTUBE-DL (которую потеряли) ---
+def get_dl_strategies():
+    base_opts = {'quiet': True, 'no_warnings': True, 'nocheckcertificate': True, 'ignoreerrors': True}
+    strategies = [
+        {'extractor_args': {'youtube': {'player_client': ['ios']}}, 'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)', **base_opts},
+        {'extractor_args': {'youtube': {'player_client': ['web']}}, **base_opts},
+        base_opts
+    ]
+    return strategies
+
+# --- МОДЕЛИ ---
 class AuthModel(BaseModel):
     login: str
     email: Optional[str] = None
@@ -202,14 +216,7 @@ class BotDownloadModel(BaseModel):
     format_type: str
     quality_id: str
 
-def get_dl_strategies():
-    base_opts = {'quiet': True, 'no_warnings': True, 'nocheckcertificate': True, 'ignoreerrors': True}
-    strategies = [
-        {'extractor_args': {'youtube': {'player_client': ['ios']}}, 'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)', **base_opts},
-        {'extractor_args': {'youtube': {'player_client': ['web']}}, **base_opts},
-        base_opts
-    ]
-    return strategies
+# --- ENDPOINTS ---
 
 @app.post("/register")
 def reg(d: AuthModel):
@@ -276,6 +283,8 @@ def update_profile(d: ProfileUpdateModel):
         logger.error(f"Profile update error: {e}")
         raise HTTPException(500, "Internal server error")
 
+# --- AVATAR HANDLING (DB STORAGE) ---
+
 @app.post("/user/avatar/upload")
 async def upload_avatar(username: str = Form(...), file: UploadFile = File(...)):
     try:
@@ -288,37 +297,52 @@ async def upload_avatar(username: str = Form(...), file: UploadFile = File(...))
 
         file_bytes = await file.read()
         
-        # Определяем расширение файла
-        if file.filename:
-            file_extension = os.path.splitext(file.filename)[1]
-        else:
-            # Определяем тип по содержимому
-            if file_bytes[:4] == b'GIF8':
-                file_extension = '.gif'
-            elif file_bytes[:8] == b'\x89PNG\r\n\x1a\n':
-                file_extension = '.png'
-            elif file_bytes[:2] == b'\xff\xd8':
-                file_extension = '.jpg'
-            else:
-                file_extension = '.png'
+        # Определяем mime type
+        media_type = "image/png"
+        header = file_bytes[:4]
+        if header == b'GIF8': 
+            media_type = 'image/gif'
+        elif header.startswith(b'\xff\xd8'): 
+            media_type = 'image/jpeg'
         
-        unique_filename = f"{uid}_{uuid.uuid4().hex[:8]}{file_extension}"
-        avatar_path = f"static/avatars/{unique_filename}"
-        
-        os.makedirs("static/avatars", exist_ok=True)
-        
-        with open(avatar_path, 'wb') as f:
-            f.write(file_bytes)
-        
-        avatar_url = f"/static/avatars/{unique_filename}"
+        ts = int(time.time())
+        # Ссылка, которую клиент использует для запроса файла
+        virtual_url = f"/user/content/avatar/{uid}?t={ts}"
         
         with get_cursor() as cur:
-            cur.execute("UPDATE user_profiles SET avatar_url=%s WHERE user_id=%s", (avatar_url, uid))
+            # Сохраняем байты и ссылку
+            cur.execute(
+                "UPDATE user_profiles SET avatar_data=%s, avatar_url=%s WHERE user_id=%s", 
+                (file_bytes, virtual_url, uid)
+            )
         
-        return {"status": "ok", "url": avatar_url}
+        return {"status": "ok", "url": virtual_url}
     except Exception as e:
         logger.error(f"Avatar upload error: {e}")
         raise HTTPException(500, "Internal server error")
+
+@app.get("/user/content/avatar/{user_id}")
+def get_avatar_content(user_id: int):
+    try:
+        with get_cursor() as cur:
+            cur.execute("SELECT avatar_data FROM user_profiles WHERE user_id=%s", (user_id,))
+            res = cur.fetchone()
+            
+            if not res or not res['avatar_data']:
+                return Response(content=b"", status_code=404)
+            
+            data = bytes(res['avatar_data'])
+            
+            media_type = "image/png"
+            if data[:4] == b'GIF8':
+                media_type = "image/gif"
+            elif data[:2] == b'\xff\xd8':
+                media_type = "image/jpeg"
+                
+            return Response(content=data, media_type=media_type)
+    except Exception as e:
+        logger.error(f"Get avatar error: {e}")
+        return Response(content=b"", status_code=500)
 
 @app.post("/user/avatar/delete")
 def delete_avatar_endpoint(d: DelAvatarModel):
@@ -329,21 +353,13 @@ def delete_avatar_endpoint(d: DelAvatarModel):
             if not u:
                 raise HTTPException(404)
             
-            cur.execute("SELECT avatar_url FROM user_profiles WHERE user_id=%s", (u['id'],))
-            prof = cur.fetchone()
-            if prof and prof['avatar_url']:
-                try:
-                    local_path = prof['avatar_url'].replace("/static/avatars/", "static/avatars/")
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete avatar file: {e}")
-            
-            cur.execute("UPDATE user_profiles SET avatar_url=NULL WHERE user_id=%s", (u['id'],))
+            cur.execute("UPDATE user_profiles SET avatar_url=NULL, avatar_data=NULL WHERE user_id=%s", (u['id'],))
             return {"status": "ok"}
     except Exception as e:
         logger.error(f"Avatar delete error: {e}")
         raise HTTPException(500, "Internal server error")
+
+# --- OTHER OPERATIONS ---
 
 @app.delete("/user/delete")
 def delete_user(d: DelModel):
@@ -354,16 +370,6 @@ def delete_user(d: DelModel):
             if not user or not check_pw(user['password_hash'], d.pw):
                 raise HTTPException(401, "Bad password")
             uid = user['id']
-            
-            cur.execute("SELECT avatar_url FROM user_profiles WHERE user_id=%s", (uid,))
-            prof = cur.fetchone()
-            if prof and prof['avatar_url']:
-                try:
-                    local_path = prof['avatar_url'].replace("/static/avatars/", "static/avatars/")
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
-                except:
-                    pass
             
             cur.execute("DELETE FROM messages WHERE sender_id=%s OR receiver_id=%s", (uid, uid))
             cur.execute("DELETE FROM user_profiles WHERE user_id=%s", (uid,))
@@ -426,7 +432,6 @@ def get_contacts(username: str):
             contacts = []
             for r in rows:
                 av = r['avatar_url'] or ""
-
                 contacts.append({
                     "username": r['username'],
                     "avatar_url": av,
