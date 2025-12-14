@@ -24,10 +24,7 @@ from .widgets import (
 from client.widgets.profile_page import ProfileViewDialog
 from .dialogs import EmojiPicker
 
-# --- ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ ---
-
 class QuickWorker(network.QRunnable):
-    """Выполняет простую функцию в пуле потоков без возврата результата."""
     def __init__(self, func, *args, **kwargs):
         super().__init__()
         self.func = func
@@ -45,7 +42,6 @@ class PollResultSignaler(QObject):
     msgs_loaded = Signal(list)
 
 class PollWorker(network.QRunnable):
-    """Безопасный поллинг сообщений."""
     def __init__(self, u1, u2, last_id, signal):
         super().__init__()
         self.u1 = u1
@@ -56,12 +52,14 @@ class PollWorker(network.QRunnable):
 
     def run(self):
         try:
+            # Используем глобальную сессию
             r = network.session.get(f"{network.API_URL}/messages/load", 
                                   params={"u1": self.u1, "u2": self.u2, "last_id": self.last}, 
                                   timeout=4)
             if r.status_code == 200:
                 msgs = r.json().get('messages', [])
                 if msgs:
+                    # Помечаем прочитанными асинхронно
                     ids = [m['id'] for m in msgs if m['sender_name'] != self.u1]
                     if ids:
                         network.session.post(f"{network.API_URL}/messages/read", json={"ids": ids, "user": self.u1})
@@ -84,15 +82,12 @@ class LocalAvatarLoader(network.QRunnable):
     def __init__(self, u, callback_slot):
         super().__init__()
         self.u = u
-        self.cb = callback_slot # Это должен быть лямбда/метод, вызывающий GUI обновление
+        self.cb = callback_slot
         self.setAutoDelete(True)
 
     def run(self):
         d = fetch_avatar_data(self.u)
-        # Безопасно передаем данные в GUI поток через таймер (стандартный хак для Qt <-> Python Threading)
         QTimer.singleShot(0, lambda: self.cb(d))
-
-# --- ОСНОВНОЙ КЛАСС ---
 
 class MessagesPage(QWidget):
     def __init__(self, parent=None):
@@ -110,10 +105,9 @@ class MessagesPage(QWidget):
         self.last_typing_sent = 0.0
         self.pinned_chats = set()
         
-        # Главный флаг защиты от обращения к уничтоженному объекту
-        self._is_alive = True 
+        self._is_alive = True
+        self.pending_bubbles_queue = [] # Для удаления локальных копий сообщений
 
-        # Таймеры
         self.chat_list_timer = QTimer(self)
         self.chat_list_timer.timeout.connect(self.refresh_chat_list_safe)
         
@@ -127,7 +121,6 @@ class MessagesPage(QWidget):
         self.typing_hide_timer.setSingleShot(True)
         self.typing_hide_timer.timeout.connect(self.hide_typing_label)
 
-        # Сигналеры для межпоточного взаимодействия
         self.header_signaler = HeaderResultSignaler()
         self.header_signaler.updated.connect(self._update_header_ui)
         
@@ -145,19 +138,18 @@ class MessagesPage(QWidget):
         super().showEvent(event)
 
     def closeEvent(self, e):
-        """Гарантированная остановка всего при закрытии."""
         self._is_alive = False
         self.stop_all_workers()
         super().closeEvent(e)
 
     def stop_all_workers(self):
+        """Жесткая остановка таймеров, чтобы они не вызывали методы на мертвом объекте"""
         try:
-            self.chat_list_timer.stop()
-            self.msg_poll_timer.stop()
-            self.typing_poll_timer.stop()
-            self.typing_hide_timer.stop()
-            if hasattr(self, 'spinner'):
-                self.spinner.stop()
+            if hasattr(self, 'chat_list_timer'): self.chat_list_timer.stop()
+            if hasattr(self, 'msg_poll_timer'): self.msg_poll_timer.stop()
+            if hasattr(self, 'typing_poll_timer'): self.typing_poll_timer.stop()
+            if hasattr(self, 'typing_hide_timer'): self.typing_hide_timer.stop()
+            if hasattr(self, 'spinner'): self.spinner.stop()
         except:
             pass
 
@@ -184,7 +176,8 @@ class MessagesPage(QWidget):
                 self.my_avatar_data = d
         self.start_worker(LocalAvatarLoader(self.current_user, cb))
 
-    # --- UI THEME ---
+    # --- UI UPDATE & THEME ---
+
     def apply_theme(self):
         d = self.is_dark
         l_bg = "#121217" if d else "#ffffff"
@@ -227,7 +220,6 @@ class MessagesPage(QWidget):
                 if hasattr(w, 'set_theme'):
                     w.set_theme(self.is_dark)
 
-    # --- UI SETUP ---
     def setup_ui(self):
         main = QHBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
@@ -352,7 +344,7 @@ class MessagesPage(QWidget):
         main.addWidget(self.welcome_widget)
         self.welcome_screen_mode(True)
 
-    # --- LOGIC ---
+    # --- INPUT LOGIC ---
 
     def on_input_text_changed(self):
         if time.time() - self.last_typing_sent > 3.0:
@@ -498,7 +490,10 @@ class MessagesPage(QWidget):
         self.start_worker(loader)
 
     def _fill_chats(self, chats):
-        if not chats or not self._is_alive: return
+        # Добавлена защита от обновления мертвых виджетов
+        if not chats or not self._is_alive or not self.list_w: 
+            return
+            
         existing = {}
         for i in range(self.list_w.count()):
             it = self.list_w.item(i)
@@ -538,18 +533,33 @@ class MessagesPage(QWidget):
                 self.list_w.takeItem(i)
 
     def _update_list_preview(self, u_target, text, ts):
+        if not self._is_alive or not self.list_w: return
+        
+        # Исправлено обновление виджета списка чатов без сбоев
+        found = False
         for i in range(self.list_w.count()):
             it = self.list_w.item(i)
             d = it.data(Qt.UserRole)
             if d['username'] == u_target:
-                d['last_message'] = text
-                d['timestamp'] = ts
-                nw = ChatListItem(d, self.is_list_collapsed)
+                # Обновляем данные словаря
+                new_data = d.copy()
+                new_data['last_message'] = text
+                new_data['timestamp'] = ts
+                
+                # Создаем новый виджет строки чата
+                nw = ChatListItem(new_data, self.is_list_collapsed)
                 nw.set_theme(self.is_dark)
                 nw.context_action.connect(self.handle_list_action)
+                
+                # Заменяем
                 self.list_w.setItemWidget(it, nw)
-                it.setData(Qt.UserRole, d)
-                return
+                it.setData(Qt.UserRole, new_data)
+                found = True
+                break
+        
+        # Если чата нет в списке (новый диалог) - форсируем полную перезагрузку
+        if not found:
+            self.refresh_chat_list_safe()
 
     def on_chat_selected(self, item):
         self.open_new_chat(item.data(Qt.UserRole).get('username'), item.data(Qt.UserRole))
@@ -573,6 +583,7 @@ class MessagesPage(QWidget):
             QTimer.singleShot(500, self.refresh_chat_list_safe)
 
     def open_new_chat(self, partner, full=None):
+        self.pending_bubbles_queue.clear()
         self.msg_poll_timer.stop()
         self.welcome_screen_mode(False)
         self.active_chat_user = partner
@@ -671,6 +682,7 @@ class MessagesPage(QWidget):
         r.action_edit.connect(lambda: self.on_msg_edit_req(m))
         idx = self.alay.count() - 1 if index == -1 else index
         self.alay.insertWidget(idx, r)
+        return r
 
     def _parse_message_content(self, m):
         rc = m.get('content', '')
@@ -698,6 +710,7 @@ class MessagesPage(QWidget):
         return ft, fa
 
     def poll_new_messages(self):
+        # Безопасная проверка: не запускать опрос, если окно закрыто или нет чата
         if not self.active_chat_user or not self._is_alive: return
         last = self.messages_list_data[-1]['id'] if self.messages_list_data else 0
         worker = PollWorker(self.current_user, self.active_chat_user, last, self.poll_signaler.msgs_loaded)
@@ -716,8 +729,20 @@ class MessagesPage(QWidget):
         else: ptxt = raw
         if "cmd://image" in raw and not ptxt: ptxt = "🖼️ Изображение"
         elif "cmd://file" in raw and not ptxt: ptxt = "📄 Документ"
+        
+        # Обновление превью с задержкой (опционально можно и тут обновить)
         self._update_list_preview(self.active_chat_user, ptxt, last.get('created_at'))
-        for m in uniq: self._add_bubble_to_ui(m)
+        
+        # Логика дедупликации (удаление временных сообщений)
+        for m in uniq: 
+            if m.get('sender_name') == self.current_user and self.pending_bubbles_queue:
+                try:
+                    w = self.pending_bubbles_queue.pop(0)
+                    w.deleteLater()
+                except:
+                    pass
+            self._add_bubble_to_ui(m)
+            
         self.scroll_to_bottom()
 
     def send_text(self):
@@ -725,23 +750,36 @@ class MessagesPage(QWidget):
         has = len(self.pending_attachments) > 0
         if not t and not has: return
         if not self.active_chat_user: return
+        
+        # Сбор данных вложений
         atts_ui = [{'type': a['type'], 'url': a['path']} for a in self.pending_attachments]
         atts_net = [{'path': a['path'], 'type': a['type']} for a in self.pending_attachments]
         self.inp.clear()
         self.clear_attachment_full()
         self.btn_send.animate_send()
+        
+        # Визуальное отображение (оптимистичное UI)
         ts_now = datetime.datetime.now().isoformat()
         loc = {'id': -1, 'content': t, 'sender_name': self.current_user, 'avatar_url': self.my_avatar_data, 'created_at': ts_now, 'is_read': False, 'attachments': atts_ui}
-        self._add_bubble_to_ui(loc)
+        
+        # Добавляем временное сообщение и запоминаем для последующего удаления дубля
+        w_tmp = self._add_bubble_to_ui(loc)
+        self.pending_bubbles_queue.append(w_tmp)
+        
         self.scroll_to_bottom()
+        
+        # Обновление списка чатов
         prev = t if t else ("🖼️ Изображение" if any(x['type'] == 'image' for x in atts_ui) else "📄 Документ")
         self._update_list_preview(self.active_chat_user, f"Вы: {prev}", ts_now)
         
-        # Исправлено: использование лямбда внутри воркера может приводить к сбоям GC.
-        # Теперь callback poll вызывается безопасно через QTimer после финиша
+        # Запуск фоновой задачи
+        def on_send_finish():
+            # Запускаем опрос сообщений через 500мс, но безопасно
+            if self._is_alive:
+                QTimer.singleShot(500, self.poll_new_messages)
+
         worker = SendWorker(self.current_user, self.active_chat_user, t, atts_net)
-        # Отложенный перезапуск опроса (500 мс)
-        worker.signals.finished.connect(lambda: QTimer.singleShot(500, self.poll_new_messages))
+        worker.signals.finished.connect(on_send_finish)
         self.start_worker(worker)
 
     def on_msg_delete_req(self, m):
