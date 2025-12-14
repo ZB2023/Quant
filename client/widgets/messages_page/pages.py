@@ -1,6 +1,5 @@
 import datetime
 import time
-import threading
 import requests
 from dateutil import parser as date_parser
 from PySide6.QtWidgets import (
@@ -9,21 +8,91 @@ from PySide6.QtWidgets import (
     QLineEdit, QMenu, QMessageBox, QFileDialog,
     QStackedWidget, QInputDialog, QApplication
 )
-from PySide6.QtCore import Qt, QSize, QTimer, QPoint, Slot, QThreadPool
-from PySide6.QtGui import QAction, QPalette, QColor
+from PySide6.QtCore import Qt, QSize, QTimer, QPoint, QThreadPool, QObject, Signal
+from PySide6.QtGui import QAction, QPalette
 from . import network
 from .network import (
     ThreadPoolManager, fetch_avatar_data, fetch_full_profile,
-    fetch_chat_data, task_batch_send, HeaderResultSignaler,
+    fetch_chat_data, SendWorker, HeaderResultSignaler,
     ChatLoader, HistoryLoader, ATTACHMENT_SPLITTER
 )
 from .widgets import (
     ModernAvatar, SidebarToggle, RichLoadingSpinner, ActionMorphButton,
     ChatListItem, MessageRow, MessageTextEdit, AttachmentPreviewWidget,
-    ChatHeaderButton, MAX_ATTACHMENTS, DateHeaderWidget
+    ChatHeaderButton, DateHeaderWidget
 )
 from client.widgets.profile_page import ProfileViewDialog
 from .dialogs import EmojiPicker
+
+# --- ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ ---
+
+class QuickWorker(network.QRunnable):
+    """Выполняет простую функцию в пуле потоков без возврата результата."""
+    def __init__(self, func, *args, **kwargs):
+        super().__init__()
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            self.func(*self.args, **self.kwargs)
+        except:
+            pass
+
+class PollResultSignaler(QObject):
+    msgs_loaded = Signal(list)
+
+class PollWorker(network.QRunnable):
+    """Безопасный поллинг сообщений."""
+    def __init__(self, u1, u2, last_id, signal):
+        super().__init__()
+        self.u1 = u1
+        self.u2 = u2
+        self.last = last_id
+        self.signal = signal
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            r = network.session.get(f"{network.API_URL}/messages/load", 
+                                  params={"u1": self.u1, "u2": self.u2, "last_id": self.last}, 
+                                  timeout=4)
+            if r.status_code == 200:
+                msgs = r.json().get('messages', [])
+                if msgs:
+                    ids = [m['id'] for m in msgs if m['sender_name'] != self.u1]
+                    if ids:
+                        network.session.post(f"{network.API_URL}/messages/read", json={"ids": ids, "user": self.u1})
+                    self.signal.emit(msgs)
+        except:
+            pass
+
+class HeaderWorker(network.QRunnable):
+    def __init__(self, user, signaler):
+        super().__init__()
+        self.user = user
+        self.signaler = signaler
+        self.setAutoDelete(True)
+
+    def run(self):
+        data = fetch_full_profile(self.user)
+        self.signaler.updated.emit(data if data else {"username": self.user})
+
+class LocalAvatarLoader(network.QRunnable):
+    def __init__(self, u, callback_slot):
+        super().__init__()
+        self.u = u
+        self.cb = callback_slot # Это должен быть лямбда/метод, вызывающий GUI обновление
+        self.setAutoDelete(True)
+
+    def run(self):
+        d = fetch_avatar_data(self.u)
+        # Безопасно передаем данные в GUI поток через таймер (стандартный хак для Qt <-> Python Threading)
+        QTimer.singleShot(0, lambda: self.cb(d))
+
+# --- ОСНОВНОЙ КЛАСС ---
 
 class MessagesPage(QWidget):
     def __init__(self, parent=None):
@@ -41,6 +110,10 @@ class MessagesPage(QWidget):
         self.last_typing_sent = 0.0
         self.pinned_chats = set()
         
+        # Главный флаг защиты от обращения к уничтоженному объекту
+        self._is_alive = True 
+
+        # Таймеры
         self.chat_list_timer = QTimer(self)
         self.chat_list_timer.timeout.connect(self.refresh_chat_list_safe)
         
@@ -54,9 +127,13 @@ class MessagesPage(QWidget):
         self.typing_hide_timer.setSingleShot(True)
         self.typing_hide_timer.timeout.connect(self.hide_typing_label)
 
+        # Сигналеры для межпоточного взаимодействия
         self.header_signaler = HeaderResultSignaler()
         self.header_signaler.updated.connect(self._update_header_ui)
         
+        self.poll_signaler = PollResultSignaler()
+        self.poll_signaler.msgs_loaded.connect(self._append_new)
+
         self.setup_ui()
         self.setup_attach_menu()
         self.setup_emoji_menu()
@@ -67,24 +144,29 @@ class MessagesPage(QWidget):
         self.apply_theme()
         super().showEvent(event)
 
-    def start_worker(self, worker):
-        QThreadPool.globalInstance().start(worker)
+    def closeEvent(self, e):
+        """Гарантированная остановка всего при закрытии."""
+        self._is_alive = False
+        self.stop_all_workers()
+        super().closeEvent(e)
 
     def stop_all_workers(self):
-        """Полная остановка всех фоновых задач чата."""
         try:
             self.chat_list_timer.stop()
             self.msg_poll_timer.stop()
             self.typing_poll_timer.stop()
             self.typing_hide_timer.stop()
-            self.spinner.stop()
+            if hasattr(self, 'spinner'):
+                self.spinner.stop()
         except:
             pass
 
+    def start_worker(self, worker):
+        if self._is_alive:
+            QThreadPool.globalInstance().start(worker)
+
     def set_current_user(self, u):
-        # Сначала всё останавливаем
         self.stop_all_workers()
-        
         self.current_user = u
         self.list_w.clear()
         self.active_chat_user = None
@@ -96,6 +178,13 @@ class MessagesPage(QWidget):
             self.refresh_chat_list_safe()
             self.chat_list_timer.start(5000)
 
+    def _fetch_my_avatar_data(self):
+        def cb(d):
+            if self._is_alive: 
+                self.my_avatar_data = d
+        self.start_worker(LocalAvatarLoader(self.current_user, cb))
+
+    # --- UI THEME ---
     def apply_theme(self):
         d = self.is_dark
         l_bg = "#121217" if d else "#ffffff"
@@ -122,12 +211,13 @@ class MessagesPage(QWidget):
         self.btn_send.set_theme(d)
         self.btn_emoji.set_theme(d)
         self.btn_options.set_theme(d)
+        
+        self._refresh_messages_visual_theme()
+        
         for i in range(self.list_w.count()):
             w = self.list_w.itemWidget(self.list_w.item(i))
             if isinstance(w, ChatListItem):
                 w.set_theme(d)
-        
-        self._refresh_messages_visual_theme()
 
     def _refresh_messages_visual_theme(self):
         for i in range(self.alay.count()):
@@ -137,9 +227,7 @@ class MessagesPage(QWidget):
                 if hasattr(w, 'set_theme'):
                     w.set_theme(self.is_dark)
 
-    def _fetch_my_avatar_data(self):
-        threading.Thread(target=lambda: setattr(self, 'my_avatar_data', fetch_avatar_data(self.current_user))).start()
-
+    # --- UI SETUP ---
     def setup_ui(self):
         main = QHBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
@@ -264,39 +352,38 @@ class MessagesPage(QWidget):
         main.addWidget(self.welcome_widget)
         self.welcome_screen_mode(True)
 
+    # --- LOGIC ---
+
     def on_input_text_changed(self):
         if time.time() - self.last_typing_sent > 3.0:
             self.last_typing_sent = time.time()
-            threading.Thread(target=self._send_typing_status, args=(True,), daemon=True).start()
+            self._send_typing_status(True)
 
     def _send_typing_status(self, s):
         if self.active_chat_user:
-            try:
-                requests.post(f"{network.API_URL}/messages/typing", json={"user": self.current_user, "target": self.active_chat_user, "status": s}, verify=False)
-            except:
-                pass
+            def t_req(u, t, st):
+                network.session.post(f"{network.API_URL}/messages/typing", json={"user": u, "target": t, "status": st}, timeout=2)
+            self.start_worker(QuickWorker(t_req, self.current_user, self.active_chat_user, s))
 
     def check_typing_status(self):
-        threading.Thread(target=self._worker_check_typing, daemon=True).start()
-
-    def _worker_check_typing(self):
-        try:
-            r = requests.get(f"{network.API_URL}/messages/typing", params={"user": self.active_chat_user, "me": self.current_user}, verify=False, timeout=2)
+        def chk_req(me, tgt, sig):
+            r = network.session.get(f"{network.API_URL}/messages/typing", params={"user": tgt, "me": me}, timeout=2)
             if r.json().get("is_typing"):
-                QTimer.singleShot(0, self.show_typing_label)
-        except:
-            pass
+                QTimer.singleShot(0, sig)
+        
+        self.start_worker(QuickWorker(chk_req, self.current_user, self.active_chat_user, self.show_typing_label))
 
     def show_typing_label(self):
+        if not self._is_alive: return
         self.typing_label.setVisible(True)
         self.typing_hide_timer.start(4000)
 
     def hide_typing_label(self):
-        self.typing_label.setVisible(False)
+        if self._is_alive:
+            self.typing_label.setVisible(False)
 
     def show_header_menu(self):
-        if not self.active_chat_user:
-            return
+        if not self.active_chat_user: return
         menu = QMenu(self)
         bg = "#2b2b36" if self.is_dark else "white"
         fg = "white" if self.is_dark else "black"
@@ -309,10 +396,8 @@ class MessagesPage(QWidget):
         menu.exec(self.btn_options.mapToGlobal(QPoint(0, self.btn_options.height())))
 
     def toggle_chat_list(self):
-        if self.is_list_collapsed:
-            self.expand_list()
-        else:
-            self.collapse_list()
+        if self.is_list_collapsed: self.expand_list()
+        else: self.collapse_list()
 
     def collapse_list(self):
         self.is_list_collapsed = True
@@ -334,16 +419,14 @@ class MessagesPage(QWidget):
     def update_list_items_mode(self):
         for i in range(self.list_w.count()):
             w = self.list_w.itemWidget(self.list_w.item(i))
-            if w:
-                w.set_collapsed(self.is_list_collapsed)
+            if w: w.set_collapsed(self.is_list_collapsed)
 
     def _filter_chat_list(self, t):
         st = t.lower().strip()
         for i in range(self.list_w.count()):
             it = self.list_w.item(i)
             w = self.list_w.itemWidget(it)
-            if w:
-                it.setHidden(st not in w.data.get('username','').lower())
+            if w: it.setHidden(st not in w.data.get('username', '').lower())
 
     def setup_attach_menu(self):
         self.attach_menu = QMenu(self)
@@ -371,8 +454,7 @@ class MessagesPage(QWidget):
         self.btn_emoji.clicked.connect(self.show_emoji_picker)
 
     def show_emoji_picker(self):
-        if time.time() - self._last_emoji_close_time < 0.3:
-            return
+        if time.time() - self._last_emoji_close_time < 0.3: return
         p = self.btn_emoji.mapToGlobal(QPoint(0, 0))
         x = (p.x()+self.btn_emoji.width()) - self.emoji_picker.width()
         y = p.y() - self.emoji_picker.height() - 10
@@ -387,21 +469,19 @@ class MessagesPage(QWidget):
     def attach_document(self):
         if self.active_chat_user:
             fs, _ = QFileDialog.getOpenFileNames(self, "Files", "", "All (*.*)")
-            for p in fs:
-                self.add_attachment(p,'file')
+            for p in fs: self.add_attachment(p, 'file')
 
     def attach_image(self):
         if self.active_chat_user:
             fs, _ = QFileDialog.getOpenFileNames(self, "Images", "", "Image (*.png *.jpg *.gif)")
-            for p in fs:
-                self.add_attachment(p,'image')
+            for p in fs: self.add_attachment(p, 'image')
 
     def add_attachment(self, p, t):
-        self.pending_attachments.append({'path':p,'type':t})
-        self.attachment_preview.add_file(p,t)
+        self.pending_attachments.append({'path': p, 'type': t})
+        self.attachment_preview.add_file(p, t)
 
     def remove_attachment_data(self, p):
-        self.pending_attachments=[a for a in self.pending_attachments if a['path']!=p]
+        self.pending_attachments = [a for a in self.pending_attachments if a['path'] != p]
 
     def clear_attachment_full(self):
         self.pending_attachments = []
@@ -412,28 +492,23 @@ class MessagesPage(QWidget):
         self.welcome_widget.setVisible(w)
 
     def refresh_chat_list_safe(self):
-        if not self.current_user:
-            return
+        if not self.current_user: return
         loader = ChatLoader(self.current_user)
         loader.signals.loaded.connect(self._fill_chats)
         self.start_worker(loader)
 
     def _fill_chats(self, chats):
-        if not chats:
-            return
+        if not chats or not self._is_alive: return
         existing = {}
         for i in range(self.list_w.count()):
             it = self.list_w.item(i)
             d = it.data(Qt.UserRole)
-            if d and 'username' in d:
-                existing[d['username']] = it
+            if d and 'username' in d: existing[d['username']] = it
         
         pinned, normal = [], []
         for c in chats:
-            if c['username'] in self.pinned_chats:
-                pinned.append(c)
-            else:
-                normal.append(c)
+            if c['username'] in self.pinned_chats: pinned.append(c)
+            else: normal.append(c)
         
         curs = set()
         for c in pinned + normal:
@@ -481,43 +556,43 @@ class MessagesPage(QWidget):
 
     def handle_list_action(self, act, data):
         u = data.get('username')
-        if not u:
-            return
-        if act=="pin":
-            if u in self.pinned_chats:
-                self.pinned_chats.remove(u)
-            else:
-                self.pinned_chats.add(u)
+        if not u: return
+        if act == "pin":
+            if u in self.pinned_chats: self.pinned_chats.remove(u)
+            else: self.pinned_chats.add(u)
             self.refresh_chat_list_safe()
-        elif act=="clear_history":
-            requests.post(f"{network.API_URL}/messages/clear", json={"me":self.current_user,"target":u,"for_all":False},verify=False)
+        elif act == "clear_history":
+            def clr(m, t):
+                network.session.post(f"{network.API_URL}/messages/clear", json={"me": m, "target": t, "for_all": False}, verify=False)
+            self.start_worker(QuickWorker(clr, self.current_user, u))
             self.open_new_chat(u)
+        elif act == "delete_chat":
+            def d_ch(m, t):
+                network.session.post(f"{network.API_URL}/messages/clear", json={"me": m, "target": t, "for_all": False}, verify=False)
+            self.start_worker(QuickWorker(d_ch, self.current_user, u))
+            QTimer.singleShot(500, self.refresh_chat_list_safe)
 
     def open_new_chat(self, partner, full=None):
         self.msg_poll_timer.stop()
         self.welcome_screen_mode(False)
-        
         self.active_chat_user = partner
         self.loaded_count = 0
         self.messages_list_data = []
         self.clear_chat_area()
         self.clear_attachment_full()
-        
-        self._apply_header_data(full if full else {"username":partner})
+        self._apply_header_data(full if full else {"username": partner})
         self.spinner.start()
         self.content_stack.setCurrentIndex(1)
-        threading.Thread(target=self._bg_fetch_header, args=(partner,), daemon=True).start()
+        self.start_worker(HeaderWorker(partner, self.header_signaler))
         QTimer.singleShot(100, self._load_initial_history)
         self.typing_poll_timer.start(2500)
-
-    def _bg_fetch_header(self, u):
-        self.header_signaler.updated.emit(fetch_full_profile(u) or {"username":u})
 
     def _update_header_ui(self, d):
         if d.get('username') == self.active_chat_user:
             self._apply_header_data(d)
 
     def _apply_header_data(self, d):
+        if not self._is_alive: return
         dn = d.get('display_name') or d.get('username', "Unknown")
         self.head_name.setText(dn)
         io = d.get('is_online', False)
@@ -534,10 +609,10 @@ class MessagesPage(QWidget):
         QTimer.singleShot(8000, self._force_stop_loading)
 
     def _force_stop_loading(self):
-        if self.is_loading_history and self.content_stack.currentIndex()==1:
+        if self.is_loading_history and self.content_stack.currentIndex() == 1:
             self.spinner.stop()
             self.content_stack.setCurrentIndex(0)
-            self.is_loading_history=False
+            self.is_loading_history = False
             self.msg_poll_timer.start(3000)
 
     def check_pagination(self, v):
@@ -549,8 +624,8 @@ class MessagesPage(QWidget):
 
     def _handle_history_loaded(self, msgs, off):
         self.content_stack.setCurrentIndex(0)
-        self.is_loading_history=False
-        if not msgs and off==0:
+        self.is_loading_history = False
+        if not msgs and off == 0:
             self.msg_poll_timer.start(3000)
             return
         if off == 0:
@@ -561,12 +636,13 @@ class MessagesPage(QWidget):
             old_h = self.scroll.verticalScrollBar().maximum()
             self.messages_list_data = msgs + self.messages_list_data
             self.redraw_chat(True)
-            QTimer.singleShot(10, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()-old_h))
+            QTimer.singleShot(10, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum() - old_h))
         self.loaded_count = len(self.messages_list_data)
-        if off==0:
+        if off == 0:
             self.msg_poll_timer.start(3000)
 
     def redraw_chat(self, full=False):
+        if not self._is_alive: return
         if full:
             self.clear_chat_area()
             ld = None
@@ -575,7 +651,7 @@ class MessagesPage(QWidget):
                     if m.get('created_at'):
                         ds = date_parser.parse(m['created_at']).strftime("%Y-%m-%d")
                         if ds != ld:
-                            self.alay.insertWidget(self.alay.count()-1, DateHeaderWidget(ds, parent=self))
+                            self.alay.insertWidget(self.alay.count() - 1, DateHeaderWidget(ds, parent=self))
                             ld = ds
                 except:
                     pass
@@ -589,32 +665,32 @@ class MessagesPage(QWidget):
                 ts = date_parser.parse(m['created_at'])
         except:
             pass
-        r = MessageRow(txt, m.get('sender_name')==self.current_user, m.get('sender_name'), m.get('avatar_url'), atts, ts, m.get('is_read'))
+        r = MessageRow(txt, m.get('sender_name') == self.current_user, m.get('sender_name'), m.get('avatar_url'), atts, ts, m.get('is_read'))
         r.set_theme(self.is_dark)
         r.action_delete.connect(lambda: self.on_msg_delete_req(m))
         r.action_edit.connect(lambda: self.on_msg_edit_req(m))
-        idx = self.alay.count()-1 if index == -1 else index
+        idx = self.alay.count() - 1 if index == -1 else index
         self.alay.insertWidget(idx, r)
 
     def _parse_message_content(self, m):
-        rc = m.get('content','')
+        rc = m.get('content', '')
         ft = ""
         fa = m.get('attachments') or []
         if ATTACHMENT_SPLITTER in rc:
             p = rc.split(ATTACHMENT_SPLITTER)
             ft = p[0]
-            for x in p[1:]: 
-                if x.startswith("cmd://"): 
+            for x in p[1:]:
+                if x.startswith("cmd://"):
                     try:
-                        t,u=x[6:].split("::",1)
-                        fa.append({'type':t,'url':u})
+                        t, u = x[6:].split("::", 1)
+                        fa.append({'type': t, 'url': u})
                     except:
                         pass
         else:
-            if rc.startswith("cmd://"): 
+            if rc.startswith("cmd://"):
                 try:
-                    t,u=rc[6:].split("::",1)
-                    fa.append({'type':t,'url':u})
+                    t, u = rc[6:].split("::", 1)
+                    fa.append({'type': t, 'url': u})
                 except:
                     ft = rc
             else:
@@ -622,71 +698,51 @@ class MessagesPage(QWidget):
         return ft, fa
 
     def poll_new_messages(self):
+        if not self.active_chat_user or not self._is_alive: return
         last = self.messages_list_data[-1]['id'] if self.messages_list_data else 0
-        threading.Thread(target=self._worker_poll, args=(last,)).start()
-
-    def _worker_poll(self, last):
-        try:
-            r=requests.get(f"{network.API_URL}/messages/load", params={"u1":self.current_user, "u2":self.active_chat_user, "last_id":last}, verify=False, timeout=4)
-            if r.status_code == 200:
-                msgs=r.json().get('messages', [])
-                if msgs:
-                    ids=[m['id'] for m in msgs if m['sender_name']!=self.current_user]
-                    if ids:
-                        requests.post(f"{network.API_URL}/messages/read", json={"ids":ids, "user":self.current_user}, verify=False)
-                    QTimer.singleShot(0, lambda: self._append_new(msgs))
-        except:
-            pass
+        worker = PollWorker(self.current_user, self.active_chat_user, last, self.poll_signaler.msgs_loaded)
+        self.start_worker(worker)
 
     def _append_new(self, msgs):
-        if not msgs:
-            return
+        if not msgs or not self._is_alive: return
         exist = {m['id'] for m in self.messages_list_data}
         uniq = [m for m in msgs if m['id'] not in exist]
-        if not uniq:
-            return
+        if not uniq: return
         self.messages_list_data.extend(uniq)
         self.loaded_count += len(uniq)
-        
         last = uniq[-1]
         raw = last.get('content', '')
-        ptxt = raw.split(ATTACHMENT_SPLITTER)[0] if ATTACHMENT_SPLITTER in raw else raw
-        if "cmd://image" in raw and not ptxt:
-            ptxt="🖼️ Изображение"
-        elif "cmd://file" in raw and not ptxt:
-            ptxt="📄 Документ"
+        if ATTACHMENT_SPLITTER in raw: ptxt = raw.split(ATTACHMENT_SPLITTER)[0]
+        else: ptxt = raw
+        if "cmd://image" in raw and not ptxt: ptxt = "🖼️ Изображение"
+        elif "cmd://file" in raw and not ptxt: ptxt = "📄 Документ"
         self._update_list_preview(self.active_chat_user, ptxt, last.get('created_at'))
-        for m in uniq:
-            self._add_bubble_to_ui(m)
+        for m in uniq: self._add_bubble_to_ui(m)
         self.scroll_to_bottom()
 
     def send_text(self):
         t = self.inp.toPlainText().strip()
-        has = len(self.pending_attachments)>0
-        if not t and not has:
-            return
-        if not self.active_chat_user:
-            return
+        has = len(self.pending_attachments) > 0
+        if not t and not has: return
+        if not self.active_chat_user: return
         atts_ui = [{'type': a['type'], 'url': a['path']} for a in self.pending_attachments]
         atts_net = [{'path': a['path'], 'type': a['type']} for a in self.pending_attachments]
         self.inp.clear()
         self.clear_attachment_full()
         self.btn_send.animate_send()
-        
         ts_now = datetime.datetime.now().isoformat()
-        loc = {
-            'id': -1, 'content': t, 'sender_name': self.current_user,
-            'avatar_url': self.my_avatar_data, 'created_at': ts_now,
-            'is_read': False, 'attachments': atts_ui
-        }
+        loc = {'id': -1, 'content': t, 'sender_name': self.current_user, 'avatar_url': self.my_avatar_data, 'created_at': ts_now, 'is_read': False, 'attachments': atts_ui}
         self._add_bubble_to_ui(loc)
         self.scroll_to_bottom()
-        
-        prev = t if t else ("🖼️ Изображение" if any(x['type']=='image' for x in atts_ui) else "📄 Документ")
+        prev = t if t else ("🖼️ Изображение" if any(x['type'] == 'image' for x in atts_ui) else "📄 Документ")
         self._update_list_preview(self.active_chat_user, f"Вы: {prev}", ts_now)
         
-        threading.Thread(target=task_batch_send, args=(self.current_user, self.active_chat_user, t, atts_net)).start()
-        QTimer.singleShot(500, self.poll_new_messages)
+        # Исправлено: использование лямбда внутри воркера может приводить к сбоям GC.
+        # Теперь callback poll вызывается безопасно через QTimer после финиша
+        worker = SendWorker(self.current_user, self.active_chat_user, t, atts_net)
+        # Отложенный перезапуск опроса (500 мс)
+        worker.signals.finished.connect(lambda: QTimer.singleShot(500, self.poll_new_messages))
+        self.start_worker(worker)
 
     def on_msg_delete_req(self, m):
         mb = QMessageBox(self)
@@ -696,29 +752,28 @@ class MessagesPage(QWidget):
         b_all = mb.addButton("У всех", QMessageBox.DestructiveRole)
         mb.addButton("Отмена", QMessageBox.RejectRole)
         mb.exec()
-        if mb.clickedButton() in (b_me, b_all):
-            requests.post(f"{network.API_URL}/messages/delete_one", json={"id":m['id'],"for_all":(mb.clickedButton()==b_all),"user":self.current_user}, verify=False)
+        btn = mb.clickedButton()
+        if btn in (b_me, b_all):
+            for_all = (btn == b_all)
+            def del_act(mid, all_f, usr):
+                network.session.post(f"{network.API_URL}/messages/delete_one", json={"id": mid, "for_all": all_f, "user": usr}, verify=False)
+            self.start_worker(QuickWorker(del_act, m['id'], for_all, self.current_user))
             QTimer.singleShot(200, self._load_initial_history)
 
     def on_msg_edit_req(self, m):
         t, _ = self._parse_message_content(m)
         nt, ok = QInputDialog.getMultiLineText(self, "Edit", "Text:", t)
         if ok and nt.strip():
-            requests.post(f"{network.API_URL}/messages/edit", json={"id":m['id'],"new_text":nt,"user":self.current_user}, verify=False)
+            def ed_act(mid, txt, usr):
+                network.session.post(f"{network.API_URL}/messages/edit", json={"id": mid, "new_text": txt, "user": usr}, verify=False)
+            self.start_worker(QuickWorker(ed_act, m['id'], nt, self.current_user))
             QTimer.singleShot(200, self._load_initial_history)
 
-    def scroll_to_bottom(self): 
+    def scroll_to_bottom(self):
         self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
 
     def clear_chat_area(self):
         while self.alay.count():
             item = self.alay.takeAt(0)
-            if item.widget(): 
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
         self.alay.addStretch()
-
-    def closeEvent(self, e):
-        self.chat_list_timer.stop()
-        self.msg_poll_timer.stop()
-        self.typing_poll_timer.stop()
-        super().closeEvent(e)

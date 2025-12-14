@@ -312,6 +312,8 @@ class FriendsPage(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._is_alive = True
+        
         self.username = ""
         self.current_incoming = None
         self.current_friends = None
@@ -432,17 +434,21 @@ class FriendsPage(QWidget):
     def on_loader_finished(self):
         self.is_loading = False
 
+    # Модифицируйте колбэки обновления данных
     def upd_in(self, d):
+        if not self._is_alive: return # <--- ЗАЩИТА
         if d != self.current_incoming:
             self.current_incoming = d
             self.render_all()
     
     def upd_fr(self, d):
+        if not self._is_alive: return # <--- ЗАЩИТА
         if d != self.current_friends:
             self.current_friends = d
             self.render_all()
     
     def upd_bl(self, d):
+        if not self._is_alive: return # <--- ЗАЩИТА
         if d != self.current_blocked:
             self.current_blocked = d
             self.render_all()
@@ -554,3 +560,8 @@ class FriendsPage(QWidget):
         if hasattr(self, 'timer'):
             self.timer.stop()
         self.is_loading = False
+        
+    def closeEvent(self, e):
+        self._is_alive = False
+        self.stop_all_workers()
+        super().closeEvent(e)
