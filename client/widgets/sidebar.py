@@ -1,32 +1,29 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QRunnable, QThreadPool, Signal, QObject
 import requests
 import urllib3
 from client.widgets.avatar_view import CircularAvatar, AvatarViewer
 
 urllib3.disable_warnings()
 
-class Fetcher(QThread):
+class FetcherSignals(QObject):
     done = Signal(bytes)
-    
+
+class Fetcher(QRunnable):
     def __init__(self, api, u):
         super().__init__()
         self.api = api
         self.u = u
-    
+        self.signals = FetcherSignals()
+
     def run(self):
         try:
-            if self.isInterruptionRequested():
-                return
             r = requests.get(f"{self.api}/user/profile_info", params={"username": self.u}, verify=False, timeout=5)
-            if self.isInterruptionRequested():
-                return
             if r.status_code == 200:
                 u = r.json().get('avatar_url')
                 if u:
                     res = requests.get(u, verify=False, timeout=5)
-                    if not self.isInterruptionRequested():
-                        self.done.emit(res.content)
+                    self.signals.done.emit(res.content)
         except:
             pass
 
@@ -37,8 +34,7 @@ class Sidebar(QWidget):
         self.setObjectName("Sidebar")
         self.api_url = "https://localhost:8001"
         self.u_name = "Guest"
-        self.f = None
-        
+
         l = QVBoxLayout(self)
         l.setContentsMargins(20, 40, 20, 20)
         l.setSpacing(10)
@@ -69,35 +65,28 @@ class Sidebar(QWidget):
         l.addWidget(self.btn_msg)
         l.addWidget(self.btn_settings)
         l.addStretch()
-    
+
     def open_preview(self):
         if self.av.raw_data:
             AvatarViewer(self.av.raw_data, self.window()).exec()
-    
+
     def btn(self, txt):
         b = QPushButton(txt)
         b.setCursor(Qt.PointingHandCursor)
         b.setFixedHeight(45)
         b.setObjectName("NavBtn")
         return b
-    
+
     def set_api_url(self, u):
         self.api_url = u
-    
+
     def set_username(self, n):
         self.u_name = n
         self.n_lbl.setText(n)
         self.reload_avatar()
-    
+
     def reload_avatar(self):
         self.av.set_letter(self.u_name)
-        if self.f and self.f.isRunning():
-            return
-        self.f = Fetcher(self.api_url, self.u_name)
-        self.f.done.connect(self.av.set_data)
-        self.f.finished.connect(self.f.deleteLater)
-        self.f.finished.connect(self._clear_fetcher_ref)
-        self.f.start()
-    
-    def _clear_fetcher_ref(self):
-        self.f = None
+        f = Fetcher(self.api_url, self.u_name)
+        f.signals.done.connect(self.av.set_data)
+        QThreadPool.globalInstance().start(f)

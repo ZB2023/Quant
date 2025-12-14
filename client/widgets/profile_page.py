@@ -2,34 +2,31 @@ import hashlib
 import requests
 import urllib3
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QDialog, QPushButton, QGraphicsDropShadowEffect
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QRunnable, QThreadPool, Signal, QObject
 from PySide6.QtGui import QColor
 from client.widgets.avatar_view import CircularAvatar, AvatarViewer
 
 urllib3.disable_warnings()
-
 API_URL = "https://localhost:8001"
 
-class PLoader(QThread):
+class PSignals(QObject):
     res = Signal(dict, bytes)
-    
+
+class PLoader(QRunnable):
     def __init__(self, u):
         super().__init__()
         self.u = u
-    
+        self.signals = PSignals()
+
     def run(self):
         d = {"friends": "0", "status": "", "bio": ""}
         ab = None
         try:
-            if self.isInterruptionRequested():
-                return
-            r1 = requests.get(f"{API_URL}/friends/list", params={"user": self.u}, verify=False)
+            r1 = requests.get(f"{API_URL}/friends/list", params={"user": self.u}, verify=False, timeout=3)
             if r1.status_code == 200:
                 d["friends"] = str(len(r1.json().get("friends", [])))
             
-            if self.isInterruptionRequested():
-                return
-            r2 = requests.get(f"{API_URL}/user/profile_info", params={"username": self.u}, verify=False)
+            r2 = requests.get(f"{API_URL}/user/profile_info", params={"username": self.u}, verify=False, timeout=3)
             if r2.status_code == 200:
                 j = r2.json()
                 d["status"] = j.get("status_msg", "")
@@ -42,8 +39,7 @@ class PLoader(QThread):
         except:
             pass
         
-        if not self.isInterruptionRequested():
-            self.res.emit(d, ab or b'')
+        self.signals.res.emit(d, ab or b'')
 
 class BaseProfileView(QWidget):
     def __init__(self, username=None, parent=None):
@@ -51,9 +47,7 @@ class BaseProfileView(QWidget):
         self.layout_main = QVBoxLayout(self)
         self.layout_main.setAlignment(Qt.AlignCenter)
         self.layout_main.setContentsMargins(0, 0, 0, 0)
-        
-        self.ld = None
-        
+
         self.card = QFrame()
         self.card.setObjectName("AuthCard")
         self.card.setFixedSize(550, 600)
@@ -119,11 +113,11 @@ class BaseProfileView(QWidget):
         
         if username:
             self.set_user(username)
-    
+
     def show_preview(self):
         if self.av.raw_data:
             AvatarViewer(self.av.raw_data, self.window()).exec()
-    
+
     def st(self, t, v):
         bl = QVBoxLayout()
         bl.setSpacing(2)
@@ -133,19 +127,18 @@ class BaseProfileView(QWidget):
         l1.setStyleSheet("font-size:10px; font-weight:bold;")
         l2 = QLabel(v)
         l2.setAlignment(Qt.AlignCenter)
-        l2.setObjectName("Header")
-        l2.setStyleSheet("font-size:18px;")
         l2.setObjectName("Val")
+        l2.setStyleSheet("font-size:18px;")
         bl.addWidget(l1)
         bl.addWidget(l2)
         return bl
-    
+
     def sv(self, lo, v):
         for i in range(lo.count()):
             w = lo.itemAt(i).widget()
             if w and w.objectName() == "Val":
                 w.setText(str(v))
-    
+
     def set_user(self, u):
         if not u:
             return
@@ -156,21 +149,13 @@ class BaseProfileView(QWidget):
         m = hashlib.md5(u.encode()).hexdigest()
         self.sv(self.l_id, f"#{int(m, 16)%9999:04d}")
         self.refresh()
-    
+
     def refresh(self):
         if hasattr(self, 'usr'):
-            if self.ld and self.ld.isRunning():
-                return
-            
-            self.ld = PLoader(self.usr)
-            self.ld.res.connect(self.done)
-            self.ld.finished.connect(self.ld.deleteLater)
-            self.ld.finished.connect(self._clear_ld_ref)
-            self.ld.start()
-    
-    def _clear_ld_ref(self):
-        self.ld = None
-    
+            l = PLoader(self.usr)
+            l.signals.res.connect(self.done)
+            QThreadPool.globalInstance().start(l)
+
     def done(self, d, b):
         self.b.setText(d['bio'] or "No bio.")
         self.s.setText(d['status'] or "")
@@ -187,7 +172,7 @@ class ProfileViewDialog(QDialog):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(600, 650)
-        
+
         l = QVBoxLayout(self)
         l.setContentsMargins(10, 10, 10, 10)
         
@@ -204,9 +189,9 @@ class ProfileViewDialog(QDialog):
         self.btn_close.setStyleSheet("border:none; color:#777; font-size:18px; font-weight:bold;")
         
         l.addWidget(self.prof)
-    
+
     def mousePressEvent(self, e):
         self._dp = e.globalPosition().toPoint() - self.pos()
-    
+
     def mouseMoveEvent(self, e):
         self.move(e.globalPosition().toPoint() - self._dp)

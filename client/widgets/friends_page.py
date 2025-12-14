@@ -8,23 +8,30 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect, QMessageBox,
     QGraphicsOpacityEffect, QSizePolicy
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QPropertyAnimation, QSize, QPointF
+from PySide6.QtCore import Qt, Signal, QTimer, QRunnable, QThreadPool, QObject, QPropertyAnimation, QSize, QPointF
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QBrush
 from client.widgets.avatar_view import CircularAvatar
 
 urllib3.disable_warnings()
 API_URL = "https://localhost:8001"
 
-class AvatarLoader(QThread):
+class WorkerSignals(QObject):
+    finished = Signal()
     loaded = Signal(bytes)
-    
-    def __init__(self, url):  # Correctly defined without parent argument
-        super().__init__()  # QObject parent should be set via setParent if needed, or omitted
+    incoming = Signal(list)
+    friends = Signal(list)
+    blocked = Signal(list)
+
+class AvatarLoader(QRunnable):
+    def __init__(self, url):
+        super().__init__()
+        self.signals = WorkerSignals()
         self.url = url
-        self._running = True
-    
+
     def run(self):
-        if not self._running or not self.url:
+        if not self.url:
+            self.signals.loaded.emit(b"")
+            self.signals.finished.emit()
             return
         
         try:
@@ -32,17 +39,43 @@ class AvatarLoader(QThread):
             if target and not target.startswith("http"):
                 target = f"{API_URL}/{target}"
             
-            if self._running:
-                r = requests.get(target, verify=False, timeout=5)
-                if self._running and r.status_code == 200:
-                    self.loaded.emit(r.content)
+            r = requests.get(target, verify=False, timeout=5)
+            if r.status_code == 200:
+                self.signals.loaded.emit(r.content)
+            else:
+                self.signals.loaded.emit(b"")
         except:
-            if self._running:
-                self.loaded.emit(b"")
-    
-    def stop(self):
-        self._running = False
-        self.quit()
+            self.signals.loaded.emit(b"")
+        finally:
+            self.signals.finished.emit()
+
+class FriendsLoader(QRunnable):
+    def __init__(self, user):
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.user = user
+
+    def run(self):
+        if not self.user:
+            self.signals.finished.emit()
+            return
+        
+        try:
+            r1 = requests.get(f"{API_URL}/friends/incoming", params={"user": self.user}, verify=False, timeout=3)
+            if r1.status_code == 200:
+                self.signals.incoming.emit(r1.json().get("requests", []))
+            
+            r2 = requests.get(f"{API_URL}/friends/list", params={"user": self.user}, verify=False, timeout=3)
+            if r2.status_code == 200:
+                self.signals.friends.emit(r2.json().get("friends", []))
+
+            r3 = requests.get(f"{API_URL}/blacklist/list", params={"user": self.user}, verify=False, timeout=3)
+            if r3.status_code == 200:
+                self.signals.blocked.emit(r3.json().get("blocked", []))
+        except:
+            pass
+        finally:
+            self.signals.finished.emit()
 
 class ActionIconBtn(QPushButton):
     def __init__(self, mode, color_hex, size=36, parent=None):
@@ -139,7 +172,7 @@ class ToastNotification(QFrame):
         super().__init__(parent)
         self.setFixedSize(300, 50)
         self.hide()
-        
+
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(15)
         shadow.setYOffset(4)
@@ -165,34 +198,6 @@ class ToastNotification(QFrame):
         self.show()
         self.raise_()
         self.timer_hide.start(3000)
-
-class FriendsLoader(QThread):
-    friends_loaded = Signal(list)
-    incoming_loaded = Signal(list)
-    blocked_loaded = Signal(list)
-
-    def __init__(self, user):
-        super().__init__()
-        self.user = user
-
-    def run(self):
-        if not self.user:
-            return
-        
-        try:
-            r1 = requests.get(f"{API_URL}/friends/incoming", params={"user": self.user}, verify=False, timeout=3)
-            if r1.status_code == 200:
-                self.incoming_loaded.emit(r1.json().get("requests", []))
-            
-            r2 = requests.get(f"{API_URL}/friends/list", params={"user": self.user}, verify=False, timeout=3)
-            if r2.status_code == 200:
-                self.friends_loaded.emit(r2.json().get("friends", []))
-
-            r3 = requests.get(f"{API_URL}/blacklist/list", params={"user": self.user}, verify=False, timeout=3)
-            if r3.status_code == 200:
-                self.blocked_loaded.emit(r3.json().get("blocked", []))
-        except:
-            pass
 
 class FriendCard(QFrame):
     action_clicked = Signal(str, str)
@@ -223,12 +228,9 @@ class FriendCard(QFrame):
         self.avatar_widget.set_letter(self.username)
         
         if self.avatar_url:
-            # FIX: Removed invalid 'parent' argument
-            self.bg_loader = AvatarLoader(self.avatar_url)
-            self.bg_loader.setParent(self) # Can set parent explicitly after init if needed for automatic cleanup
-            self.bg_loader.loaded.connect(self.avatar_widget.set_data)
-            self.bg_loader.finished.connect(self.bg_loader.deleteLater)
-            self.bg_loader.start()
+            self.loader = AvatarLoader(self.avatar_url)
+            self.loader.signals.loaded.connect(self.avatar_widget.set_data)
+            QThreadPool.globalInstance().start(self.loader)
         
         info = QVBoxLayout()
         info.setSpacing(2)
@@ -311,11 +313,11 @@ class FriendsPage(QWidget):
     def __init__(self):
         super().__init__()
         self.username = ""
-        self.loader_thread = None
         self.current_incoming = None
         self.current_friends = None
         self.current_blocked = None
         self.filter_text = ""
+        self.is_loading = False
         self.init_ui()
         
         self.toast = ToastNotification(self)
@@ -396,39 +398,30 @@ class FriendsPage(QWidget):
         self.load_friends()
 
     def load_friends(self):
-        if not self.username:
+        if not self.username or self.is_loading:
             return
         
-        try:
-            if self.loader_thread and self.loader_thread.isRunning():
-                return
-        except RuntimeError:
-            self.loader_thread = None
-
-        self.loader_thread = FriendsLoader(self.username)
-        self.loader_thread.incoming_loaded.connect(self.upd_in)
-        self.loader_thread.friends_loaded.connect(self.upd_fr)
-        self.loader_thread.blocked_loaded.connect(self.upd_bl)
-        
-        self.loader_thread.finished.connect(self.on_loader_finished)
-        self.loader_thread.start()
+        self.is_loading = True
+        loader = FriendsLoader(self.username)
+        loader.signals.incoming.connect(self.upd_in)
+        loader.signals.friends.connect(self.upd_fr)
+        loader.signals.blocked.connect(self.upd_bl)
+        loader.signals.finished.connect(self.on_loader_finished)
+        QThreadPool.globalInstance().start(loader)
 
     def on_loader_finished(self):
-        sender = self.sender()
-        if self.loader_thread == sender:
-            self.loader_thread.deleteLater()
-            self.loader_thread = None
+        self.is_loading = False
 
     def upd_in(self, d):
         if d != self.current_incoming:
             self.current_incoming = d
             self.render_all()
-        
+    
     def upd_fr(self, d):
         if d != self.current_friends:
             self.current_friends = d
             self.render_all()
-        
+    
     def upd_bl(self, d):
         if d != self.current_blocked:
             self.current_blocked = d
@@ -536,21 +529,6 @@ class FriendsPage(QWidget):
 
     def api(self, ep, d):
         QTimer.singleShot(0, lambda: requests.post(f"{API_URL}{ep}", json=d, verify=False))
-        
+
     def stop_all_workers(self):
-        if self.loader_thread and self.loader_thread.isRunning():
-            self.loader_thread.quit()
-            self.loader_thread.wait(1000)
-            if self.loader_thread.isRunning():
-                self.loader_thread.terminate()
-            self.loader_thread.deleteLater()
-            self.loader_thread = None
-        
-        for child in self.findChildren(AvatarLoader):
-            if child.isRunning():
-                child.stop()
-                child.quit()
-                child.wait(1000)
-                if child.isRunning():
-                    child.terminate()
-                child.deleteLater()
+        pass
