@@ -33,6 +33,8 @@ class PLoader(QRunnable):
                 d["bio"] = j.get("bio", "")
                 u = j.get("avatar_url")
                 if u:
+                    if u.startswith("/"):
+                        u = f"{API_URL}{u}"
                     ir = requests.get(u, verify=False, timeout=5)
                     if ir.status_code == 200:
                         ab = ir.content

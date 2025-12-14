@@ -22,6 +22,8 @@ class Fetcher(QRunnable):
             if r.status_code == 200:
                 u = r.json().get('avatar_url')
                 if u:
+                    if u.startswith("/"):
+                        u = f"{self.api}{u}"
                     res = requests.get(u, verify=False, timeout=5)
                     self.signals.done.emit(res.content)
         except:

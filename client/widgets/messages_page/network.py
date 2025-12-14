@@ -9,6 +9,7 @@ import urllib3
 import os
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 API_URL = "https://localhost:8001"
 ATTACHMENT_SPLITTER = "<<<SPLIT>>>"
 
@@ -128,12 +129,54 @@ class HistoryLoader(QRunnable):
 class ImgSignals(QObject):
     loaded = Signal(object)
 
+class DataSignals(QObject):
+    loaded = Signal(bytes)
+
+class DataLoader(QRunnable):
+    """ Loads raw bytes (allows GIF animation) handling relative URLs """
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.signals = DataSignals()
+        self.loaded = self.signals.loaded 
+        self.setAutoDelete(True)
+
+    def run(self):
+        if not self.url:
+            self.signals.loaded.emit(b"")
+            return
+        try:
+            target = str(self.url)
+            # Если это путь на диске
+            if os.path.exists(target):
+                with open(target, 'rb') as f:
+                    self.signals.loaded.emit(f.read())
+            else:
+                # Если это сетевой путь
+                if target.startswith("/"):
+                    target = f"{API_URL}{target}"
+                
+                if target.startswith("http"):
+                    r = requests.get(target, verify=False, timeout=10)
+                    if r.status_code == 200:
+                        self.signals.loaded.emit(r.content)
+                    else:
+                        self.signals.loaded.emit(b"")
+                else:
+                    self.signals.loaded.emit(b"")
+        except:
+            self.signals.loaded.emit(b"")
+            
+    def start(self):
+        QThreadPool.globalInstance().start(self)
+
 class ChatImageLoader(QRunnable):
+    """ Loads QImage (for static processing/thumbnails), handling relative URLs """
     def __init__(self, url):
         super().__init__()
         self.url = url
         self.signals = ImgSignals()
-        self.loaded = self.signals.loaded
+        self.loaded = self.signals.loaded 
         self.setAutoDelete(True)
 
     def run(self):
@@ -141,25 +184,32 @@ class ChatImageLoader(QRunnable):
             self.signals.loaded.emit(None)
             return
         try:
-            img = QImage()
-            if os.path.exists(self.url):
-                img.load(self.url)
-            elif str(self.url).startswith("http"):
-                r = requests.get(self.url, verify=False, timeout=10)
-                if r.status_code == 200:
-                    img.loadFromData(r.content)
-            if not img.isNull():
-                self.signals.loaded.emit(img)
+            target = str(self.url)
+            # Local
+            if os.path.exists(target):
+                img = QImage()
+                img.load(target)
+                if not img.isNull():
+                    self.signals.loaded.emit(img)
+                else:
+                    self.signals.loaded.emit(None)
             else:
-                self.signals.loaded.emit(None)
+                # Remote
+                if target.startswith("/"):
+                    target = f"{API_URL}{target}"
+                
+                if target.startswith("http"):
+                    r = requests.get(target, verify=False, timeout=10)
+                    if r.status_code == 200:
+                        img = QImage()
+                        img.loadFromData(r.content)
+                        self.signals.loaded.emit(img if not img.isNull() else None)
+                    else:
+                        self.signals.loaded.emit(None)
+                else:
+                    self.signals.loaded.emit(None)
         except:
             self.signals.loaded.emit(None)
 
-    def setParent(self, p):
-        pass
-
     def start(self):
         QThreadPool.globalInstance().start(self)
-
-    def loaded_connect(self, slot):
-        self.signals.loaded.connect(slot)

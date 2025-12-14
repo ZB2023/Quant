@@ -9,25 +9,31 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QSize, Property, QPropertyAnimation,
-    QBuffer, QIODevice, QPoint, QUrl, QRectF, QRect
+    QBuffer, QIODevice, QPoint, QUrl, QRectF, QRect, QByteArray
 )
 from PySide6.QtGui import (
     QFont, QColor, QPainter, QPainterPath,
     QPen, QBrush, QLinearGradient, QMovie, QFontMetrics,
-    QDesktopServices, QPixmap, QConicalGradient
+    QDesktopServices, QPixmap, QConicalGradient, QImage
 )
 from client.widgets.messages_page.dialogs import HybridGalleryOverlay
 from .cache import ImageCache
-from .network import ChatImageLoader
+from .network import ChatImageLoader, DataLoader
 
 MAX_ATTACHMENTS = 10
 ATTACHMENT_SPLITTER = "<<<SPLIT>>>"
 
 def open_local_or_remote_file(path_str):
+    # Приводим путь к нормальному URL для десктоп сервисов
     url = QUrl(path_str)
+    # Если это локальный путь и не протокол
     if not path_str.startswith("http") and not path_str.startswith("file://"):
+        # Если существует на диске (например C:\...)
         if os.path.exists(path_str):
             url = QUrl.fromLocalFile(os.path.abspath(path_str))
+        elif path_str.startswith("/"): # Если это путь с сервера, то только в браузере или вьювере
+            return
+            
     QDesktopServices.openUrl(url)
 
 class DateHeaderWidget(QWidget):
@@ -127,23 +133,92 @@ class AttachmentChip(QFrame):
             self.lp.setPixmap(rn)
 
 class AspectRatioLabel(QLabel):
+    """
+    Авто-скейл изображения. 
+    Обновлен: умеет принимать raw bytes (set_full_data) и создавать QMovie для GIF,
+    отображая полностью в рамках 380x500 (Aspect Ratio).
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setScaledContents(False)
-        self.original_pixmap=None
-        self.loader=None
+        self.setScaledContents(False) # Сами рисуем
+        self.movie = None
+        self.pixmap_cached = None
+        self.buf = None
 
-    def set_full_pixmap(self, img_obj):
-        if not img_obj or img_obj.isNull():
+    def set_full_data(self, data):
+        # Очищаем старое
+        if self.movie:
+            self.movie.stop()
+            self.movie = None
+        self.pixmap_cached = None
+
+        if not data:
             self.setText("Error")
             return
-        pm = QPixmap.fromImage(img_obj)
-        self.original_pixmap=pm
-        sc = pm
-        if pm.width()>380 or pm.height()>500:
-            sc=pm.scaled(QSize(380,500), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        super().setPixmap(sc)
-        self.setFixedSize(sc.size())
+        
+        is_gif = (data[:6].startswith(b'GIF') or b'WEBPVP8' in data[:20])
+        
+        if is_gif:
+            self.buf = QBuffer()
+            self.buf.setData(data)
+            self.buf.open(QIODevice.ReadOnly)
+            self.movie = QMovie(self.buf, b"GIF")
+            self.movie.start()
+            # Для определения размеров можно подождать, но проще взять frame 0
+            self.movie.frameChanged.connect(self.repaint)
+            self.setMinimumSize(50, 50)
+            self.resize(300, 200) # Init
+        else:
+            pm = QPixmap()
+            pm.loadFromData(data)
+            if pm.isNull():
+                self.setText("Error")
+            else:
+                self.pixmap_cached = pm
+                # Init scale
+                self.resize_to_fit()
+                
+    def resize_to_fit(self):
+        pm = None
+        if self.movie and self.movie.currentPixmap():
+             pm = self.movie.currentPixmap()
+        elif self.pixmap_cached:
+             pm = self.pixmap_cached
+        
+        if pm and not pm.isNull():
+             # Max Box
+             w, h = 380, 500
+             if pm.width() <= w and pm.height() <= h:
+                 sc_size = pm.size()
+             else:
+                 sc_size = pm.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation).size()
+             self.setFixedSize(sc_size)
+
+    def paintEvent(self, e):
+        # Отрисовка с сохранением пропорций и масштабированием под виджет
+        target = None
+        if self.movie:
+             target = self.movie.currentPixmap()
+             # Динамический ресайз виджета под первый кадр
+             if self.width() == 300 and self.height() == 200: 
+                 self.resize_to_fit()
+        elif self.pixmap_cached:
+             target = self.pixmap_cached
+             
+        if target and not target.isNull():
+             p = QPainter(self)
+             p.setRenderHint(QPainter.Antialiasing)
+             p.setRenderHint(QPainter.SmoothPixmapTransform)
+             
+             w, h = self.width(), self.height()
+             sc = target.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+             
+             # Рисуем по центру
+             x = (w - sc.width()) // 2
+             y = (h - sc.height()) // 2
+             p.drawPixmap(x, y, sc)
+        else:
+             super().paintEvent(e)
 
 class AttachmentPreviewWidget(QFrame):
     attachment_removed = Signal(str)
@@ -192,6 +267,9 @@ class AttachmentPreviewWidget(QFrame):
         self.setVisible(False)
 
 class ModernAvatar(QWidget):
+    """
+    Теперь умеет качать сырые данные (DataLoader) для отображения GIF.
+    """
     def __init__(self, size=40, text="?", status_color=None, parent=None):
         super().__init__(parent)
         self.setFixedSize(size,size)
@@ -205,14 +283,21 @@ class ModernAvatar(QWidget):
 
     def set_data(self, t, d=None):
         self.tx=t.upper() if t else "?"
-        if not d: 
-            self.pm=None
+        # Сброс
+        self.pm=None
+        if self.mv: 
+            self.mv.stop()
             self.mv=None
+
+        if not d: 
             self.update()
             return
-        if isinstance(d,str) and d.startswith("http"):
-            self.ld=ChatImageLoader(d)
-            self.ld.loaded.connect(self._ap)
+
+        # Логика загрузки
+        if isinstance(d,str) and (d.startswith("http") or d.startswith("/")):
+            # Используем DataLoader для bytes
+            self.ld = DataLoader(d)
+            self.ld.loaded.connect(self._Lb)
             self.ld.start()
         elif isinstance(d,bytes): 
             self._Lb(d)
@@ -220,26 +305,27 @@ class ModernAvatar(QWidget):
             self._L64(d)
         self.update()
 
-    def _ap(self, io): 
-        if io and not io.isNull(): 
-            self.pm=QPixmap.fromImage(io)
-            self.update()
-
     def _Lb(self, d):
         if not d: 
             return
+        # Определение GIF
         anim = (d[:6].startswith(b'GIF') or b'WEBPVP8' in d[:20])
         k=f"av_{hash(d)&0xFFFFFFFF}"
+        
         if anim: 
             self.bf=QBuffer()
             self.bf.setData(d)
             self.bf.open(QIODevice.ReadOnly)
-            self.mv=self.ic.get_movie(k,self.bf)
+            self.mv=self.ic.get_movie(k, self.bf)
+        
         if self.mv and self.mv.isValid(): 
             self.mv.frameChanged.connect(self.repaint)
             self.mv.start()
         else: 
-            self.pm=self.ic.get_pixmap(k,d)
+            # Не анимация или кэш пиксмапа
+            self.pm=self.ic.get_pixmap(k, d)
+        
+        self.update()
 
     def _L64(self, s):
         try: 
@@ -261,16 +347,20 @@ class ModernAvatar(QWidget):
         p.save()
         p.setClipPath(pth)
         dn=False
+        
+        # Если есть Movie и он играет
         if self.mv and self.mv.state()==QMovie.Running:
             c=self.mv.currentPixmap()
             if not c.isNull(): 
                 s=c.scaled(self.size(),Qt.KeepAspectRatioByExpanding,Qt.SmoothTransformation)
                 p.drawPixmap((self.width()-s.width())//2,(self.height()-s.height())//2,s)
                 dn=True
+        # Иначе статика
         elif self.pm and not self.pm.isNull():
             s=self.pm.scaled(self.size(),Qt.KeepAspectRatioByExpanding,Qt.SmoothTransformation)
             p.drawPixmap((self.width()-s.width())//2,(self.height()-s.height())//2,s)
             dn=True
+        
         if not dn:
             g=QLinearGradient(0,0,self.width(),self.height())
             g.setColorAt(0,self.bg)
@@ -280,6 +370,8 @@ class ModernAvatar(QWidget):
             p.setFont(QFont("Segoe UI",int(self.height()*0.45),QFont.Bold))
             p.drawText(self.rect(),Qt.AlignCenter,self.tx)
         p.restore()
+        
+        # Индикатор статуса
         if self.st: 
             ds=int(self.width()*0.28)
             p.setPen(QPen(QColor("#181820"),2))
@@ -485,6 +577,7 @@ class ChatListItem(QWidget):
         d = data.get('display_name') or u
         av_url = data.get('avatar_url')
         self.avatar = ModernAvatar(48, d[0])
+        # Data passed here. ModernAvatar now handles logic to download relative paths too.
         self.avatar.set_data(d[0], av_url)
         self.layout.addWidget(self.avatar)
         self.info_widget = QWidget()
@@ -585,9 +678,11 @@ class ChatBubble(QFrame):
                 al = AspectRatioLabel()
                 al.setStyleSheet("background:rgba(0,0,0,0.1); border-radius:8px;")
                 al.setCursor(Qt.PointingHandCursor)
-                ld = ChatImageLoader(url)
-                ld.loaded.connect(lambda p, w=al: w.set_full_pixmap(p))
+                # Используем DataLoader чтобы работали GIFы и в Bubble
+                ld = DataLoader(url)
+                ld.loaded.connect(al.set_full_data)
                 ld.start()
+                # Кликом передаем картинку (вьювер пока на Pixmap, анимация во вьювере может быть добавлена по аналогии)
                 al.mousePressEvent = lambda e, u=url: self._open_viewer(u)
                 self.layout.addWidget(al)
             else:
@@ -615,6 +710,8 @@ class ChatBubble(QFrame):
         self.update_bubble_theme(True)
 
     def _open_viewer(self, u):
+        # Viewer пока прост, оставим ChatImageLoader для него, 
+        # но передаем QPixmap. В идеале Overlay тоже надо научить играть GIF
         l = ChatImageLoader(u)
         l.loaded.connect(lambda p: HybridGalleryOverlay(QPixmap.fromImage(p), self.window()).exec() if p else None)
         self._tmp = l
