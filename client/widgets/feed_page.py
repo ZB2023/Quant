@@ -1011,11 +1011,11 @@ class ManageDialog(DraggableDialogMixin, QDialog):
         self.modified = True; self.accept()
 
 class FeedWorker(QRunnable):
-    def __init__(self, feeds, parent=None):
+    def __init__(self, feeds):  # Убрать parent
         super().__init__()
         self.feeds = feeds
-        self.sig = ImgSig()  # Создаем в основном потоке
-        self._is_running = True  # Флаг для остановки
+        self.sig = ImgSig()
+        self._is_running = True
 
     def run(self):
         out = []

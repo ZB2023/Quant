@@ -18,14 +18,15 @@ API_URL = "https://localhost:8001"
 class AvatarLoader(QThread):
     loaded = Signal(bytes)
     
-    def __init__(self, url, parent=None):
-        super().__init__(parent)
+    def __init__(self, url):  # Correctly defined without parent argument
+        super().__init__()  # QObject parent should be set via setParent if needed, or omitted
         self.url = url
         self._running = True
     
     def run(self):
         if not self._running or not self.url:
             return
+        
         try:
             target = self.url
             if target and not target.startswith("http"):
@@ -170,8 +171,8 @@ class FriendsLoader(QThread):
     incoming_loaded = Signal(list)
     blocked_loaded = Signal(list)
 
-    def __init__(self, user, parent=None):  # Добавлен parent
-        super().__init__(parent)  # Передаем parent
+    def __init__(self, user):
+        super().__init__()
         self.user = user
 
     def run(self):
@@ -222,7 +223,9 @@ class FriendCard(QFrame):
         self.avatar_widget.set_letter(self.username)
         
         if self.avatar_url:
-            self.bg_loader = AvatarLoader(self.avatar_url, parent=self)
+            # FIX: Removed invalid 'parent' argument
+            self.bg_loader = AvatarLoader(self.avatar_url)
+            self.bg_loader.setParent(self) # Can set parent explicitly after init if needed for automatic cleanup
             self.bg_loader.loaded.connect(self.avatar_widget.set_data)
             self.bg_loader.finished.connect(self.bg_loader.deleteLater)
             self.bg_loader.start()
@@ -537,14 +540,17 @@ class FriendsPage(QWidget):
     def stop_all_workers(self):
         if self.loader_thread and self.loader_thread.isRunning():
             self.loader_thread.quit()
-            self.loader_thread.wait()
+            self.loader_thread.wait(1000)
+            if self.loader_thread.isRunning():
+                self.loader_thread.terminate()
             self.loader_thread.deleteLater()
             self.loader_thread = None
         
-        # Останавливаем AvatarLoader потоки
         for child in self.findChildren(AvatarLoader):
             if child.isRunning():
                 child.stop()
                 child.quit()
-                child.wait()
+                child.wait(1000)
+                if child.isRunning():
+                    child.terminate()
                 child.deleteLater()

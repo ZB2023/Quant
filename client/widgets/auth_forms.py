@@ -45,8 +45,8 @@ def update_global_api_url(new_url):
 class NetworkWorker(QObject):
     finished = Signal(dict)
     
-    def __init__(self, task_type, url, data=None, parent=None):  # Добавлен parent
-        super().__init__(parent)  # Передаем parent
+    def __init__(self, task_type, url, data=None):  # Убрать parent=None
+        super().__init__()  # Не передавать parent в QObject
         self.task_type = task_type
         self.url = url
         self.data = data
@@ -221,7 +221,7 @@ class ServerConfigDialog(QDialog):
         self.status_bar.setStyleSheet("color: #fbbf24;") # Желтый
         
         self.thread = QThread()
-        self.worker = NetworkWorker("ping", full_url, parent=self)
+        self.worker = NetworkWorker("ping", full_url)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_check_finished)
@@ -375,7 +375,7 @@ class LoginView(QWidget):
         self.btn_enter.setText("Подключение...")
         
         self.thread = QThread()
-        self.worker = NetworkWorker("login", API_URL, {"login": u, "pw": p}, self)  # Добавлен self
+        self.worker = NetworkWorker("login", API_URL, {"login": u, "pw": p})
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_login_finished)
@@ -460,7 +460,7 @@ class RegisterView(QWidget):
         self.btn_reg.setEnabled(False)
         
         self.thread = QThread()
-        self.worker = NetworkWorker("register", API_URL, data, self)
+        self.worker = NetworkWorker("register", API_URL, data)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.on_reg_finished)

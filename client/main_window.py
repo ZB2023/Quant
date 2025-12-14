@@ -1,4 +1,5 @@
 from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QStackedWidget
+from PySide6.QtCore import QThread
 from client.widgets.auth_forms import AuthPage
 from client.widgets.lanchat_page import LanChatWidget, LanSetupWidget, LanWorker
 from client.widgets.sidebar import Sidebar
@@ -93,14 +94,17 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(2)
         
     def closeEvent(self, event):
-        """При закрытии приложения останавливаем все потоки"""
+        # Останавливаем глобальный пул потоков
+        from PySide6.QtCore import QThreadPool
+        QThreadPool.globalInstance().clear()
+        QThreadPool.globalInstance().waitForDone(3000)  # Ждем 3 секунды
+        
         # Останавливаем LAN worker
         if hasattr(self, 'lan_worker'):
             self.lan_worker.close()
         
         # Останавливаем все потоки в content area
         if hasattr(self, 'content'):
-            # Останавливаем потоки в дочерних виджетах
             if hasattr(self.content, 'msg'):
                 self.content.msg.stop_all_workers()
             if hasattr(self.content, 'fr'):
@@ -108,9 +112,14 @@ class MainWindow(QMainWindow):
             if hasattr(self.content, 'mp'):
                 self.content.mp.stop_all_workers()
         
-        # Останавливаем потоки в auth page
+        # Останавливаем все потоки в auth page
         if hasattr(self, 'auth_page'):
-            # Останавливаем NetworkWorker потоки
-            pass
+            # Находим и останавливаем все NetworkWorker потоки
+            for thread in self.auth_page.findChildren(QThread):
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(1000)
+                    if thread.isRunning():
+                        thread.terminate()
         
         event.accept()

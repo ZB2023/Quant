@@ -39,8 +39,8 @@ QMenu::item:selected {
 class APIWorker(QThread):
     finished = Signal(object)
     
-    def __init__(self, endpoint, data=None, method="GET", parent=None):
-        super().__init__(parent)  # ВАЖНО: Привязка к родителю
+    def __init__(self, endpoint, data=None, method="GET"):
+        super().__init__()
         self.endpoint = endpoint
         self.data = data
         self.method = method
@@ -891,7 +891,8 @@ class MediaPage(QWidget):
         if self.w_g and self.w_g.isRunning():
             return
             
-        self.w_g = APIWorker("/media/groups", {"username": self.current_user}, parent=self) # PARENT!
+        self.w_g = APIWorker("/media/groups", {"username": self.current_user})
+        self.w_g.setParent(self) # Can set explicitly
         self.w_g.finished.connect(self.got_groups)
         self.w_g.start()
     
@@ -979,13 +980,15 @@ class MediaPage(QWidget):
         if dlg.exec():
             self.api = APIWorker("/media/group/update", {"id": d['id'], "title": dlg.inp_title.text(),
                                                         "author": dlg.inp_author.text(), "genre": dlg.inp_genre.text(),
-                                                        "cover_path": dlg.cover_path}, "PUT", parent=self)
+                                                        "cover_path": dlg.cover_path}, "PUT")
+            self.api.setParent(self)
             self.api.finished.connect(lambda x: self.refresh_groups())
             self.api.start()
     
     def delete_grp(self, d):
         if QMessageBox.question(self, "?", f"Удалить {d['title']}?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self.api = APIWorker("/media/group/delete", {"id": d['id']}, "DELETE", parent=self)
+            self.api = APIWorker("/media/group/delete", {"id": d['id']}, "DELETE")
+            self.api.setParent(self)
             self.api.finished.connect(lambda x: self.refresh_groups())
             self.api.start()
     
@@ -999,7 +1002,8 @@ class MediaPage(QWidget):
                 "genre": d.inp_genre.text(), 
                 "cover_path": d.cover_path
             }
-            self.w_add_g = APIWorker("/media/group", payload, "POST", parent=self)
+            self.w_add_g = APIWorker("/media/group", payload, "POST")
+            self.w_add_g.setParent(self)
             self.w_add_g.finished.connect(lambda x: self.refresh_groups())
             self.w_add_g.start()
     
@@ -1027,7 +1031,8 @@ class MediaPage(QWidget):
     def refresh_tracks(self):
         if not self.active_group:
             return
-        self.w_tr = APIWorker("/media/tracks", {"group_id": self.active_group}, parent=self)
+        self.w_tr = APIWorker("/media/tracks", {"group_id": self.active_group})
+        self.w_tr.setParent(self)
         self.w_tr.finished.connect(self.on_tracks_loaded)
         self.w_tr.start()
     
@@ -1102,7 +1107,8 @@ class MediaPage(QWidget):
         if dlg.exec():
             dd = dlg.accept_data
             dd['id'] = d['id']
-            self.w_up = APIWorker("/media/track/update", dd, "PUT", parent=self)
+            self.w_up = APIWorker("/media/track/update", dd, "PUT")
+            self.w_up.setParent(self)
             self.w_up.finished.connect(lambda x: self.force_refresh())
             self.w_up.start()
     
@@ -1115,7 +1121,8 @@ class MediaPage(QWidget):
                 self.player_ui.vinyl.set_playing(False)
                 self.player_ui.vinyl.set_progress(0, 0)
             
-            self.w_del = APIWorker("/media/track/delete", {"id": d['id']}, "DELETE", parent=self)
+            self.w_del = APIWorker("/media/track/delete", {"id": d['id']}, "DELETE")
+            self.w_del.setParent(self)
             self.w_del.finished.connect(lambda x: self.force_refresh())
             self.w_del.start()
     
@@ -1123,7 +1130,8 @@ class MediaPage(QWidget):
         d = TrackDialog(mode="add", group_id=self.active_group, existing_tracks=self.current_album_tracks, parent=self)
         if d.exec():
             d.accept_data['parent_id'] = d.accept_data.get('parent_id')
-            self.w_add_t = APIWorker("/media/track", d.accept_data, "POST", parent=self)
+            self.w_add_t = APIWorker("/media/track", d.accept_data, "POST")
+            self.w_add_t.setParent(self)
             self.w_add_t.finished.connect(lambda x: self.force_refresh())
             self.w_add_t.start()
     
