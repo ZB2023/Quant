@@ -1,21 +1,20 @@
 import base64
-import math
 import os
 import datetime
 from dateutil import parser as date_parser
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSizePolicy, QTextEdit,
-    QGridLayout, QAbstractButton, QTextBrowser, QMenu, QStackedLayout, QApplication
+    QAbstractButton, QMenu, QStackedLayout, QApplication
 )
 from PySide6.QtCore import (
-    Qt, Signal, QTimer, QSize, Property, QPropertyAnimation, QEasingCurve,
-    QBuffer, QIODevice, QPoint, QUrl, QPointF, QRectF, QRect, QThreadPool
+    Qt, Signal, QTimer, QSize, Property, QPropertyAnimation,
+    QBuffer, QIODevice, QPoint, QUrl, QRectF, QRect
 )
 from PySide6.QtGui import (
     QFont, QColor, QPainter, QPainterPath,
     QPen, QBrush, QLinearGradient, QMovie, QFontMetrics,
-    QDesktopServices, QCursor, QPixmap, QConicalGradient
+    QDesktopServices, QPixmap, QConicalGradient
 )
 from client.widgets.messages_page.dialogs import HybridGalleryOverlay
 from .cache import ImageCache
@@ -215,8 +214,10 @@ class ModernAvatar(QWidget):
             self.ld=ChatImageLoader(d)
             self.ld.loaded.connect(self._ap)
             self.ld.start()
-        elif isinstance(d,bytes): self._Lb(d)
-        elif isinstance(d,str) and d.startswith("data:"): self._L64(d)
+        elif isinstance(d,bytes): 
+            self._Lb(d)
+        elif isinstance(d,str) and d.startswith("data:"): 
+            self._L64(d)
         self.update()
 
     def _ap(self, io): 
@@ -225,7 +226,8 @@ class ModernAvatar(QWidget):
             self.update()
 
     def _Lb(self, d):
-        if not d: return
+        if not d: 
+            return
         anim = (d[:6].startswith(b'GIF') or b'WEBPVP8' in d[:20])
         k=f"av_{hash(d)&0xFFFFFFFF}"
         if anim: 
@@ -299,7 +301,8 @@ class SidebarToggle(QAbstractButton):
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(self.rect(),6,6)
         p.translate(self.width()/2,self.height()/2)
-        if self.c: p.rotate(180)
+        if self.c: 
+            p.rotate(180)
         p.setPen(QPen(QColor(200,200,200),2))
         pt=QPainterPath()
         pt.moveTo(3,-5)
@@ -336,7 +339,8 @@ class RichLoadingSpinner(QWidget):
         self.setVisible(False)
 
     def paintEvent(self, e):
-        if not self.is_spin: return
+        if not self.is_spin: 
+            return
         p=QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w,h=self.width(),self.height()
@@ -363,12 +367,18 @@ class ActionMorphButton(QAbstractButton):
         self.asend.setDuration(400)
         self.asend.finished.connect(lambda:self.set_snd(0.0))
 
-    def get_m(self): return self._m
-    def set_m(self,v): self._m=v; self.update()
+    def get_m(self): 
+        return self._m
+    def set_m(self,v): 
+        self._m=v
+        self.update()
     morph=Property(float,get_m,set_m)
 
-    def get_snd(self): return self._s
-    def set_snd(self,v): self._s=v; self.update()
+    def get_snd(self): 
+        return self._s
+    def set_snd(self,v): 
+        self._s=v
+        self.update()
     snd=Property(float,get_snd,set_snd)
 
     def enterEvent(self,e): 

@@ -9,7 +9,6 @@ import urllib3
 import os
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 API_URL = "https://localhost:8001"
 ATTACHMENT_SPLITTER = "<<<SPLIT>>>"
 
@@ -134,6 +133,7 @@ class ChatImageLoader(QRunnable):
         super().__init__()
         self.url = url
         self.signals = ImgSignals()
+        self.loaded = self.signals.loaded
         self.setAutoDelete(True)
 
     def run(self):
