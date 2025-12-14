@@ -318,12 +318,16 @@ class FriendsPage(QWidget):
         self.current_blocked = None
         self.filter_text = ""
         self.is_loading = False
-        self.init_ui()
         
-        self.toast = ToastNotification(self)
+        # 1. СОЗДАЕМ TOAST ДО ПОСТРОЕНИЯ ИНТЕРФЕЙСА
+        self.toast = ToastNotification(self) 
+
+        # 2. Создаем таймер, но НЕ запускаем его (автостарт убрали)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.load_friends)
-        self.timer.start(5000)
+
+        # 3. Теперь строим интерфейс
+        self.init_ui()
 
     def init_ui(self):
         m = QVBoxLayout(self)
@@ -386,16 +390,32 @@ class FriendsPage(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if self.toast.isVisible():
+        # проверка hasattr на случай раннего вызова
+        if hasattr(self, 'toast') and self.toast.isVisible():
             self.toast.move((self.width() - 300) // 2, self.height() - 80)
 
     def set_user(self, u):
+        # Сначала останавливаем всё старое
+        self.stop_all_workers()
+        
         self.username = u
         self.current_incoming = None
         self.current_friends = None
         self.current_blocked = None
+        
+        # Очищаем интерфейс перед загрузкой
+        while self.cl.count():
+            it = self.cl.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+            
+        if not self.username:
+            return
+
         self.render_all()
         self.load_friends()
+        # Запускаем таймер только если есть пользователь
+        if not self.timer.isActive():
+            self.timer.start(5000)
 
     def load_friends(self):
         if not self.username or self.is_loading:
@@ -531,4 +551,6 @@ class FriendsPage(QWidget):
         QTimer.singleShot(0, lambda: requests.post(f"{API_URL}{ep}", json=d, verify=False))
 
     def stop_all_workers(self):
-        pass
+        if hasattr(self, 'timer'):
+            self.timer.stop()
+        self.is_loading = False

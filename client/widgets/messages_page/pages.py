@@ -70,7 +70,21 @@ class MessagesPage(QWidget):
     def start_worker(self, worker):
         QThreadPool.globalInstance().start(worker)
 
+    def stop_all_workers(self):
+        """Полная остановка всех фоновых задач чата."""
+        try:
+            self.chat_list_timer.stop()
+            self.msg_poll_timer.stop()
+            self.typing_poll_timer.stop()
+            self.typing_hide_timer.stop()
+            self.spinner.stop()
+        except:
+            pass
+
     def set_current_user(self, u):
+        # Сначала всё останавливаем
+        self.stop_all_workers()
+        
         self.current_user = u
         self.list_w.clear()
         self.active_chat_user = None
@@ -81,10 +95,6 @@ class MessagesPage(QWidget):
             self._fetch_my_avatar_data()
             self.refresh_chat_list_safe()
             self.chat_list_timer.start(5000)
-        else:
-            self.chat_list_timer.stop()
-            self.msg_poll_timer.stop()
-            self.typing_poll_timer.stop()
 
     def apply_theme(self):
         d = self.is_dark

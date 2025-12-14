@@ -560,27 +560,46 @@ class SwDialog(BDialog):
         self.inf.setAlignment(Qt.AlignCenter)
         self.inf.setStyleSheet("color:#64748b; font-size:12px;")
         self.cl.addWidget(self.inf)
-        bn = QPushButton("Войти")
-        bn.setObjectName("PrimaryBtn")
-        bn.clicked.connect(self.go)
-        self.cl.addWidget(bn)
+        self.bn = QPushButton("Войти")
+        self.bn.setObjectName("PrimaryBtn")
+        self.bn.clicked.connect(self.go)
+        self.cl.addWidget(self.bn)
         self.cl.addStretch()
         self.w = None
+        self.pending_login = None 
 
     def go(self):
         self.inf.setText("Вход...")
         self.inf.setStyleSheet("color:#6366f1")
+        self.bn.setEnabled(False) # Блок кнопки
+        
+        # Создаем поток авторизации БЕЗ родителя (self), чтобы GC не убил его вместе с диалогом
         self.w = AuthW(self.ul.text(), self.pw.text())
         self.w.res.connect(self.fin)
         self.w.start()
 
     def fin(self, o, m):
+        # Безопасно завершаем поток
+        if self.w:
+            self.w.quit()
+            self.w.wait()
+        
+        self.bn.setEnabled(True)
         if o:
-            self.suc.emit(m)
-            self.accept()
+            self.pending_login = m
+            self.accept() # Просто закрываем, сигнал отправим снаружи
         else:
             self.inf.setText(m)
             self.inf.setStyleSheet("color:#ef4444")
+            self.w = None # Сброс ссылки
+
+    def closeEvent(self, e):
+        # Если закрыли окно крестиком во время загрузки
+        if self.w and self.w.isRunning():
+            self.w.res.disconnect() # Отцепляем сигнал, чтобы не крашнуло
+            self.w.quit()
+            self.w.wait()
+        super().closeEvent(e)
 
 class DelDialog(BDialog):
     cf = Signal(str)
@@ -781,9 +800,24 @@ class SettingsPage(QWidget):
                 pass
 
     def c_sw(self):
-        d = SwDialog(self)
-        d.suc.connect(self.sw.emit)
-        d.exec()
+        # Передаем self.window() как родителя, чтобы диалог был модальным для всего окна, 
+        # но не привязан к SettingsPage насмерть.
+        d = SwDialog(self.window())
+        
+        # Запускаем модально
+        res = d.exec()
+        
+        if res == QDialog.Accepted and d.pending_login:
+            login = d.pending_login
+            # Разрываем стек вызовов таймером. 
+            # Диалог d уничтожится, управление вернется в Qt Loop, и только потом сработает эмит.
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(50, lambda: self.sw.emit(login))
+
+    def _safe_switch(self, login):
+        # Отложенный вызов смены пользователя
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(100, lambda: self.sw.emit(login))
 
     def c_dl(self):
         if self.u:

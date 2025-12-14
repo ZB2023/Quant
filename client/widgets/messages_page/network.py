@@ -21,18 +21,30 @@ class ThreadPoolManager:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
-                cls._instance._executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="net_worker")
-                cls._instance._futures = defaultdict(list)
+                # max_workers=4 чтобы не забивать IO
+                cls._instance._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="net_worker")
+                cls._instance._current_context_id = 0 # <-- ID текущей сессии
             return cls._instance
 
     def submit(self, username_context, task_func, *args, **kwargs):
-        future = self._executor.submit(task_func, *args, **kwargs)
-        if username_context:
-            self._futures[username_context].append(future)
-        return future
+        # Оборачиваем задачу, чтобы она знала, в какой сессии она запущена
+        context_id = self._current_context_id
+        
+        def safe_wrapper():
+            # Если сессия сменилась (ID не совпадает), не выполняем задачу (или не эмитим результат)
+            if self._current_context_id != context_id:
+                return
+            try:
+                task_func(*args, **kwargs)
+            except:
+                pass
 
-    def shutdown(self):
-        self._executor.shutdown(wait=False)
+        return self._executor.submit(safe_wrapper)
+
+    def clear_all_tasks(self):
+        """Инвалидирует (отменяет) все текущие задачи в очереди"""
+        # Мы просто меняем ID контекста. Старые задачи увидят старый ID и сделают return.
+        self._current_context_id += 1
 
 @functools.lru_cache(maxsize=128)
 def fetch_avatar_data(username):
