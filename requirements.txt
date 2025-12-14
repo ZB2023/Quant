@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+psycopg2-binary
+requests
+pyside6
+python-dotenv
+python-multipart
+cryptography
+feedparser
+beautifulsoup4
+python-dateutil
+yt-dlp
+ffmpeg-python
+aiofiles
+Pillow
