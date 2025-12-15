@@ -12,7 +12,6 @@ from client.widgets.theme_manager import ThemeManager
 import client.widgets.auth_forms
 import client.widgets.settings_page
 import client.widgets.friends_page
-# !!! ДОБАВЛЯЕМ ИМПОРТ НИЖЕ !!!
 import client.widgets.messages_page.network 
 
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +29,6 @@ DEFAULT_API_URL = f"https://localhost:{PORT}"
 client.widgets.auth_forms.API_URL = DEFAULT_API_URL
 client.widgets.settings_page.API_URL = DEFAULT_API_URL
 client.widgets.friends_page.API_URL = DEFAULT_API_URL
-# !!! ПРИМЕНЯЕМ НАСТРОЙКУ ТУТ !!!
 client.widgets.messages_page.network.API_URL = DEFAULT_API_URL
 
 def start_server_node():
